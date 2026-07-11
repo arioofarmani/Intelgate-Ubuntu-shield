@@ -343,7 +343,69 @@ menu(){ (( UI )) || return 1; local t="$1" p="$2" h w lh out rc; shift 2; read -
 checklist(){ (( UI )) || return 1; local t="$1" p="$2" h w lh; shift 2; read -r h w < <(ui_size 26 100); lh=$((h-10)); (( lh<3 )) && lh=3; whiptail --backtitle "$BT" --title " + $t " --checklist "\n$p" "$h" "$w" "$lh" "$@" 3>&1 1>&2 2>&3; }
 need_cs(){ have_cs || { msg "CrowdSec" "CrowdSec infrastructure not detected. Install the engine module first."; return 1; }; }
 
-valid_ip(){ local ip="${1%/*}" cidr="" a b c d o; [[ "$1" == */* ]] && cidr="${1#*/}"; [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS=. read -r a b c d <<<"$ip"; for o in "$a" "$b" "$c" "$d"; do [[ "$o" =~ ^[0-9]+$ ]] && ((10#$o>=0&&10#$o<=255)) || return 1; done; [[ -z "$cidr" ]] || { [[ "$cidr" =~ ^[0-9]+$ ]] && ((10#$cidr>=0&&10#$cidr<=32)); }; }
+# Dual-stack IP/CIDR validator: accepts IPv4, IPv6, and CIDR notation.
+# Returns 0 for valid, 1 for invalid. Supports compressed IPv6 (::), mixed
+# notation (::ffff:192.168.1.1), and link-local with zone IDs (%eth0).
+valid_ip(){
+  local addr="${1%%/*}" cidr="" stripped
+  [[ "$1" == */* ]] && cidr="${1#*/}"
+  # Strip zone ID (e.g. fe80::1%eth0) — valid in addresses but not in nftables
+  addr="${addr%%\%*}"
+  # --- IPv4 (with optional dotted-quad CIDR) ---
+  if [[ "$addr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    local a b c d o
+    IFS=. read -r a b c d <<<"$addr"
+    for o in "$a" "$b" "$c" "$d"; do
+      [[ "$o" =~ ^[0-9]+$ ]] || return 1
+      (( 10#"$o" >= 0 && 10#"$o" <= 255 )) || return 1
+    done
+    [[ -z "$cidr" ]] && return 0
+    [[ "$cidr" =~ ^[0-9]+$ ]] || return 1
+    (( 10#"$cidr" >= 0 && 10#"$cidr" <= 32 )) || return 1
+    return 0
+  fi
+  # --- IPv6 (compressed, full, or mixed) ---
+  # Strip all colons and hex digits; what remains must be only dots (mixed)
+  # or empty (pure IPv6). Then validate the hex groups.
+  stripped="${addr//:/}"            # remove all colons
+  stripped="${stripped//[0-9a-fA-F]/}"  # remove all hex
+  if [[ -z "$stripped" ]]; then
+    # Pure IPv6: count colon-separated groups (compressed :: counts as one or more)
+    local ngroups="${addr//[^:]}"
+    ngroups="${#ngroups}"
+    # A valid IPv6 has 7 colons (8 groups) or 1-6 colons if :: is present
+    if [[ "$addr" == *"::"* ]]; then
+      # With :: — must have <= 6 colons (at least 2 groups implied by ::)
+      (( ngroups <= 6 )) || return 1
+    else
+      # Without :: — must have exactly 7 colons (8 groups)
+      (( ngroups == 7 )) || return 1
+    fi
+    # Each group must be 1-4 hex digits
+    local IFS=':' grp
+    for grp in ${addr//::/ }; do
+      [[ -z "$grp" ]] && continue
+      [[ "$grp" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+    done
+  elif [[ "$stripped" == *"."* ]]; then
+    # Mixed notation (e.g. ::ffff:192.168.1.1) — validate the trailing IPv4 part
+    local ipv4="${addr##*:}"
+    [[ "$ipv4" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local a b c d o
+    IFS=. read -r a b c d <<<"$ipv4"
+    for o in "$a" "$b" "$c" "$d"; do
+      [[ "$o" =~ ^[0-9]+$ ]] || return 1
+      (( 10#"$o" >= 0 && 10#"$o" <= 255 )) || return 1
+    done
+  else
+    return 1
+  fi
+  # CIDR validation for IPv6 (0-128)
+  [[ -z "$cidr" ]] && return 0
+  [[ "$cidr" =~ ^[0-9]+$ ]] || return 1
+  (( 10#"$cidr" >= 0 && 10#"$cidr" <= 128 )) || return 1
+  return 0
+}
 valid_port(){ local p="$1" a b; if [[ "$p" =~ ^[0-9]{1,5}$ ]]; then (( p>=1 && p<=65535 )); return $?; fi; if [[ "$p" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; (( a>=1 && a<=65535 && b>=1 && b<=65535 && a<b )); return $?; fi; return 1; }
 
 # ---------- preflight environment + architecture discovery -------------------
@@ -364,8 +426,14 @@ preflight(){
   [[ -z "$SSH_PORT" ]] && SSH_PORT=22
   NIC="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
   [[ -z "$NIC" ]] && NIC="$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}')"
+  # Dual-stack: prefer IPv4 egress (Suricata HOME_NET is simpler), but detect IPv6 too
   PUB_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
   [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)"
+  # If no IPv4, try IPv6
+  if [[ -z "$PUB_IP" ]]; then
+    PUB_IP="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)"
+  fi
   SSH_CLIENT_IP="${SSH_CONNECTION%% *}"
   [[ -z "$SSH_CLIENT_IP" ]] && SSH_CLIENT_IP="$(who am i 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')"
   PANEL_PORT="$(ss -tlnp 2>/dev/null | awk '/x-ui|3x-ui/{n=split($4,a,":"); print a[n]}' | head -1)"
@@ -1247,14 +1315,26 @@ suricata_write_include_block(){
 
 # Write the two baseline drop-ins every install needs (HOME_NET + capture NIC),
 # then rewire the include block. Validation happens in the caller's -T pass.
+# Dual-stack: detects IPv6 egress IPs and builds the correct HOME_NET format.
 suricata_write_base_dropins(){
   mkdir -p "$SURICATA_INCLUDE_DIR"
   if [[ -n "$PUB_IP" ]]; then
+    # Build HOME_NET based on whether the egress IP is IPv4 or IPv6
+    local home_net
+    if [[ "$PUB_IP" == *":"* ]]; then
+      # IPv6 egress — use bracket notation for Suricata
+      home_net="[$PUB_IP/128,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8]"
+    else
+      # IPv4 egress
+      home_net="[$PUB_IP/32,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"
+    fi
     cat >"$SURICATA_INCLUDE_DIR/10-vars.yaml" <<EOF
-# IntelShield override — HOME_NET pinned to this relay's egress IP + RFC1918
+# IntelShield override — HOME_NET pinned to this relay's egress IP + RFC1918/ULA
+# Generated: $(date -u '+%F %T') — egress: $PUB_IP
 vars:
   address-groups:
-    HOME_NET: "[$PUB_IP/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"
+    HOME_NET: "$home_net"
+    EXTERNAL_NET: "!\\$HOME_NET"
 EOF
   fi
   if [[ -n "$NIC" ]]; then
@@ -1265,6 +1345,7 @@ af-packet:
     cluster-id: 99
     cluster-type: cluster_flow
     defrag: yes
+    use-mmap: yes
 EOF
   fi
   suricata_write_include_block
@@ -2257,23 +2338,107 @@ suricata_transactional_rules_menu(){
 }
 
 # Atomic rule state management: add/remove SIDs from disable.conf with
-# automatic validation. This replaces manual file surgery.
+# automatic validation. Uses deterministic execution gates:
+#   1. Validate input (SID must be numeric, conf must be known)
+#   2. Backup the target file before modification
+#   3. Apply the change atomically (write to tmp, then mv)
+#   4. Validate the change was applied correctly
+#   5. Log the action with timestamp
+# This replaces manual file surgery and ensures no half-written states.
 suricata_rule_state_toggle(){
-  local conf="$1" sid="$2" action="$3"  # conf = disable/enable/drop, sid = numeric, action = add/remove
-  local file=""
+  local conf="$1" sid="$2" action="$3"
+  local file="" bak="" tmp=""
+  # --- Gate 1: Input validation ---
   case "$conf" in
     disable) file="$SURICATA_DISABLE_CONF" ;;
     enable)  file="$SURICATA_ENABLE_CONF" ;;
     drop)    file="$SURICATA_DROP_CONF" ;;
-    *) return 1 ;;
+    *) log "suricata_rule_state_toggle: unknown conf '$conf'"; return 1 ;;
   esac
+  [[ "$sid" =~ ^[0-9]+$ ]] || { log "suricata_rule_state_toggle: invalid SID '$sid'"; return 1; }
+  [[ "$action" == "add" || "$action" == "remove" ]] || { log "suricata_rule_state_toggle: unknown action '$action'"; return 1; }
+  # --- Gate 2: Backup before modification ---
   touch "$file"
-  if [[ "$action" == "add" ]]; then
-    grep -qxF "$sid" "$file" 2>/dev/null || echo "$sid" >>"$file"
-  elif [[ "$action" == "remove" ]]; then
-    grep -vxF "$sid" "$file" 2>/dev/null >"$file.tmp" && mv -f "$file.tmp" "$file"
+  bak="$IS_TMP/$(basename "$file").bak.$(date +%s)"
+  cp -a "$file" "$bak" 2>/dev/null || true
+  # --- Gate 3: Atomic write ---
+  tmp="$file.tmp.$$"
+  case "$action" in
+    add)
+      grep -qxF "$sid" "$file" 2>/dev/null && {
+        log "suricata_rule_state_toggle: SID $sid already in $conf"
+        rm -f "$tmp" 2>/dev/null
+        return 0
+      }
+      cat "$file" >"$tmp" 2>/dev/null
+      echo "$sid" >>"$tmp"
+      ;;
+    remove)
+      grep -vxF "$sid" "$file" >"$tmp" 2>/dev/null
+      ;;
+  esac
+  # --- Gate 4: Validate and commit ---
+  if [[ -s "$tmp" ]] || [[ "$action" == "remove" ]]; then
+    mv -f "$tmp" "$file"
+  else
+    rm -f "$tmp" 2>/dev/null
+    log "suricata_rule_state_toggle: empty result after $action SID $sid from $conf — aborting"
+    [[ -f "$bak" ]] && cp -a "$bak" "$file" 2>/dev/null
+    return 1
   fi
-  log "suricata_rule_state: $action SID $sid in $conf"
+  # --- Gate 5: Verify the change was applied ---
+  case "$action" in
+    add)    grep -qxF "$sid" "$file" 2>/dev/null || { log "suricata_rule_state_toggle: verification failed — SID $sid not found after add"; [[ -f "$bak" ]] && cp -a "$bak" "$file" 2>/dev/null; return 1; } ;;
+    remove) grep -qxF "$sid" "$file" 2>/dev/null && { log "suricata_rule_state_toggle: verification failed — SID $sid still present after remove"; [[ -f "$bak" ]] && cp -a "$bak" "$file" 2>/dev/null; return 1; } ;;
+  esac
+  log "suricata_rule_state_toggle: $action SID $sid in $conf (verified)"
+  # Cleanup backup (keep last 5 per conf)
+  local bdir bak_count
+  bdir="$(dirname "$bak")"
+  bak_count=$(find "$bdir" -maxdepth 1 -name "$(basename "$file").bak.*" 2>/dev/null | wc -l)
+  if (( bak_count > 5 )); then
+    find "$bdir" -maxdepth 1 -name "$(basename "$file").bak.*" -printf '%T@ %p\n' 2>/dev/null \
+      | sort -n | head -n $((bak_count - 5)) | awk '{print $2}' \
+      | xargs rm -f 2>/dev/null
+  fi
+  return 0
+}
+
+# Transactional rule application: applies changes from disable/enable/drop.conf
+# with deterministic execution gates. Used by the maintenance engine and CLI.
+# Gate sequence: snapshot -> validate -> apply -> verify -> restart-or-rollback
+suricata_apply_transactional_rules(){
+  local mode="${1:-validate}"  # validate | apply
+  local pre_snapshot post_snapshot
+  # Gate 1: Snapshot current state for rollback
+  pre_snapshot="$IS_TMP/suricata-rules-pre-transactional"
+  [[ -f /var/lib/suricata/rules/suricata.rules ]] && cp -a /var/lib/suricata/rules/suricata.rules "$pre_snapshot" 2>/dev/null
+  # Gate 2: Run suricata-update to re-merge with current conf files
+  if ! run suricata-update --no-test --no-reload 2>>"$LOG"; then
+    log "suricata_apply_transactional_rules: suricata-update re-merge failed"
+    return 1
+  fi
+  # Gate 3: Validate the merged ruleset
+  if ! suricata_sanitize_rules; then
+    log "suricata_apply_transactional_rules: rule validation failed — rolling back"
+    [[ -f "$pre_snapshot" ]] && cp -a "$pre_snapshot" /var/lib/suricata/rules/suricata.rules 2>/dev/null
+    return 1
+  fi
+  # Gate 4: If in apply mode, restart Suricata
+  if [[ "$mode" == "apply" ]]; then
+    if run systemctl reload suricata && systemctl is-active --quiet suricata; then
+      log "suricata_apply_transactional_rules: rules applied and reloaded successfully"
+    else
+      restart_or_rollback suricata "" || {
+        log "suricata_apply_transactional_rules: restart failed — rolling back rules"
+        [[ -f "$pre_snapshot" ]] && cp -a "$pre_snapshot" /var/lib/suricata/rules/suricata.rules 2>/dev/null
+        run systemctl reload suricata 2>>"$LOG" || true
+        return 1
+      }
+    fi
+  fi
+  log "suricata_apply_transactional_rules: transaction completed (mode=$mode)"
+  return 0
 }
 
 #----------------------------- Wazuh Agent Integration ------------------------
