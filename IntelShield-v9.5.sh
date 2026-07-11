@@ -474,7 +474,7 @@ deploy_nft_pipeline(){
   local suri_prio="${2:-$SURICATA_FW_PRIORITY}"
   local ssh_port="${3:-22}"
   local mode="${4:-off}"
-  local nftbin="$(nft_bin)"
+  local nftbin; nftbin="$(nft_bin)"
   local ruleset="$IS_TMP/intelshield-nft.nft"
   cat >"$ruleset" <<NFTEOF
 #!/usr/sbin/nft -f
@@ -653,7 +653,7 @@ state_write(){
 
 # Export state as pretty-printed JSON for SIEM ingestion.
 state_export_siem(){
-  local outfile="${STATE_DIR}/siem-export-$(date +%Y%m%d_%H%M%S).json"
+  local outfile; outfile="${STATE_DIR}/siem-export-$(date +%Y%m%d_%H%M%S).json"
   state_write 2>/dev/null || true
   if [[ -f "$STATE_DB" ]]; then
     jq '.' "$STATE_DB" > "$outfile" 2>/dev/null; chmod 600 "$outfile"
@@ -1741,7 +1741,7 @@ anti_rootkit_menu(){ ark_init; local c; while :; do c=$(menu "Anti Rootkit Defen
 
 #----------------------------- Suricata Intelligence --------------------------
 # ---- shared safe-apply helpers ----------------------------------------------
-suricata_yaml_backup(){ local b="${SURICATA_YAML}.intelshield.$(date +%s)"; cp -a "$SURICATA_YAML" "$b" 2>/dev/null && printf '%s' "$b"; }
+suricata_yaml_backup(){ local b; b="${SURICATA_YAML}.intelshield.$(date +%s)"; cp -a "$SURICATA_YAML" "$b" 2>/dev/null && printf '%s' "$b"; }
 # test the config; on success restart; on failure restore the given backup and fail.
 suricata_validate_restart(){ local bak="${1:-}"; if suricata -T -c "$SURICATA_YAML" >>"$LOG" 2>&1; then run systemctl restart suricata; return 0; fi; [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$SURICATA_YAML"; return 1; }
 suri_mode_get(){ cat "$SURICATA_MODE_FILE" 2>/dev/null || echo ids; }
@@ -2004,7 +2004,7 @@ suricata_update_rules(){
   msg Suricata "The ruleset failed validation at the CONFIG level (not a single bad rule), so surgical repair couldn't help.\n\nSelf-heal: $healed.\nSuricata keeps running — no outage. See $LOG for the exact error."
   return 1
 }
-suricata_export_eve_summary(){ local out="/var/log/intelshield/suricata-eve-summary-$(date +%Y%m%d_%H%M%S).txt"; mkdir -p /var/log/intelshield; if [[ -f /var/log/suricata/eve.json ]] && have jq; then { echo "EVE event type counts"; jq -r '.event_type' /var/log/suricata/eve.json | sort | uniq -c | sort -rn; echo; echo "Top source IPs in alerts"; jq -r 'select(.event_type=="alert") | .src_ip' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -30; echo; echo "Top signatures"; jq -r 'select(.event_type=="alert") | .alert.signature' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -30; } >"$out"; chmod 600 "$out" 2>/dev/null || true; else echo "eve.json or jq not available" >"$out"; fi; showfile "EVE Summary Export" "$out" 34 118; }
+suricata_export_eve_summary(){ local out; out="/var/log/intelshield/suricata-eve-summary-$(date +%Y%m%d_%H%M%S).txt"; mkdir -p /var/log/intelshield; if [[ -f /var/log/suricata/eve.json ]] && have jq; then { echo "EVE event type counts"; jq -r '.event_type' /var/log/suricata/eve.json | sort | uniq -c | sort -rn; echo; echo "Top source IPs in alerts"; jq -r 'select(.event_type=="alert") | .src_ip' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -30; echo; echo "Top signatures"; jq -r 'select(.event_type=="alert") | .alert.signature' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -30; } >"$out"; chmod 600 "$out" 2>/dev/null || true; else echo "eve.json or jq not available" >"$out"; fi; showfile "EVE Summary Export" "$out" 34 118; }
 
 #----------------------------- Suricata Rule Selection ------------------------
 # Enable/disable whole rule SOURCES (ET open, etc.) via suricata-update.
