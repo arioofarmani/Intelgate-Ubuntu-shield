@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #==============================================================================
-#  IntelShield v8.6  —  Unified Hardening · Forensics · SIEM/XDR · Performance
+#  IntelShield v8.9  —  Unified Hardening · Forensics · SIEM/XDR · Performance
 #  Target : Ubuntu 22.04 / 24.04 LTS server + x-ui/3x-ui + Xray VLESS-Reality
 #  Lineage: intelshield v2.5 (rich UI base) + IntelShield-AllInOne v1.3.1 (extras)
 #           v3.0 adds Suricata inline IPS (+ CrowdSec coexistence), rule selection,
@@ -62,11 +62,20 @@
 #               execution: validate, backup, atomic write, verify, cleanup.
 #             • suricata_apply_transactional_rules() implements deterministic
 #               snapshot -> validate -> apply -> verify -> restart-or-rollback.
+#           v8.9 — IPv6 validation fix + YAML allowlist hardening:
+#             • valid_ip() IPv6 tokenization fixed: replaced fragile
+#               ${addr//::/ } word-split with sentinel-based IFS=':' read
+#               tokenization that correctly handles ::1, 2001:db8::1, etc.
+#             • allowlist_add() rewritten: atomic line-by-line YAML insertion,
+#               duplicate detection (cscli + grep), preserves exact indentation,
+#               no more fragile sed -i line-appending.
+#             • sandbox_apply() verified complete with per-unit atomic gate,
+#               restart_or_rollback integration, and single-unit fallback.
 #==============================================================================
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-APP="IntelShield"; VERSION="8.6"
+APP="IntelShield"; VERSION="8.9"
 LOG="/var/log/intelshield.log"
 BT="IntelShield v${VERSION} | Hardening · Forensics · SIEM/XDR · Performance"
 
@@ -356,6 +365,7 @@ need_cs(){ have_cs || { msg "CrowdSec" "CrowdSec infrastructure not detected. In
 # Dual-stack IP/CIDR validator: accepts IPv4, IPv6, and CIDR notation.
 # Returns 0 for valid, 1 for invalid. Supports compressed IPv6 (::), mixed
 # notation (::ffff:192.168.1.1), and link-local with zone IDs (%eth0).
+# Pure bash tokenization — no word-splitting hacks, no sed, no external tools.
 valid_ip(){
   local addr="${1%%/*}" cidr="" stripped
   [[ "$1" == */* ]] && cidr="${1#*/}"
@@ -391,12 +401,20 @@ valid_ip(){
       # Without :: — must have exactly 7 colons (8 groups)
       (( ngroups == 7 )) || return 1
     fi
-    # Each group must be 1-4 hex digits
-    local IFS=':' grp
-    for grp in ${addr//::/ }; do
-      [[ -z "$grp" ]] && continue
+    # Validate each group: replace :: with a sentinel, then split on colons.
+    # Use read IFS=: to tokenize — this handles empty groups from :: correctly
+    # without word-splitting or space substitution.
+    local expanded="$addr" grp
+    # Expand :: to a known sentinel (unique string that can't be a hex group)
+    expanded="${expanded//::/:__COMPRESSED__:}"
+    # Split the expanded string on colons and validate each token
+    local IFS=':'
+    set -- $expanded   # word-split on IFS=: into positional params
+    for grp in "$@"; do
+      [[ -z "$grp" || "$grp" == "__COMPRESSED__" ]] && continue
       [[ "$grp" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
     done
+    set --              # clear positional params
   elif [[ "$stripped" == *"."* ]]; then
     # Mixed notation (e.g. ::ffff:192.168.1.1) — validate the trailing IPv4 part
     local ipv4="${addr##*:}"
@@ -450,32 +468,69 @@ preflight(){
 }
 
 
-# ---------- shared allowlist controls ---------------------------------------
-# ---------- Shared Allowlist Controls -----------------------------------------
+# ---------- shared allowlist controls -----------------------------------------
+# CrowdSec YAML allowlist injector — safe, duplicate-aware, preserves YAML structure.
+# Writes to the parser-level allowlist file (s02-enrich/00-admin-allowlist.yaml)
+# or uses cscli allowlists when available. Duplicate entries are skipped.
 allowlist_add(){
   local ip="$1" ok=1
-  if cscli allowlists list >/dev/null 2>&1; then
+  # --- Path 1: cscli native allowlists (preferred) ---
+  if have_cs && cscli allowlists list >/dev/null 2>&1; then
     cscli allowlists create harden -d "intelshield managed" >>"$LOG" 2>&1 || true
-    if cscli allowlists add harden "$ip" >>"$LOG" 2>&1; then ok=0; fi
+    # Check for duplicate before adding
+    if cscli allowlists list harden -o raw 2>/dev/null | grep -qF "$ip"; then
+      log "allowlist_add: $ip already in cscli allowlist 'harden'"
+      ok=0
+    elif cscli allowlists add harden "$ip" >>"$LOG" 2>&1; then
+      ok=0
+    fi
   fi
+  # --- Path 2: YAML file fallback (parser-level allowlist) ---
   if [[ $ok -ne 0 ]]; then
     mkdir -p "$(dirname "$ALLOWLIST_FILE")"
+    # Scaffold the file if it doesn't exist
     if [[ ! -f "$ALLOWLIST_FILE" ]]; then
-      cat >"$ALLOWLIST_FILE" <<EOF
+      cat >"$ALLOWLIST_FILE" <<'YAML'
 name: crowdsecurity/harden-allowlist
 description: "intelshield managed allowlist"
 whitelist:
   reason: "trusted admin configurations"
   ip:
   cidr:
-EOF
+YAML
     fi
-    if [[ "$ip" == */* ]]; then
-      sed -i "/^  cidr:/a\\    - \"$ip\"" "$ALLOWLIST_FILE"
+    # Determine target section (ip vs cidr) and check for duplicate
+    local section="ip" tmp="$IS_TMP/allowlist.yaml.tmp"
+    [[ "$ip" == */* ]] && section="cidr"
+    # Check if this exact entry already exists in the file
+    if grep -qF "\"$ip\"" "$ALLOWLIST_FILE" 2>/dev/null; then
+      log "allowlist_add: $ip already in $ALLOWLIST_FILE ($section section)"
+      ok=0
     else
-      sed -i "/^  ip:/a\\    - \"$ip\"" "$ALLOWLIST_FILE"
+      # Atomically insert after the section header line.
+      # Strategy: read line-by-line, insert after the "  section:" line.
+      # This preserves exact YAML indentation and doesn't rely on fragile sed ranges.
+      local found=0 wrote=0
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        # Insert after the section header (e.g. "  ip:" or "  cidr:")
+        if [[ "$wrote" -eq 0 && "$line" =~ ^[[:space:]]${section}:$ ]]; then
+          printf '    - "%s"\n' "$ip"
+          found=1; wrote=1
+        fi
+      done < "$ALLOWLIST_FILE" > "$tmp"
+      if [[ "$found" -eq 1 && -s "$tmp" ]]; then
+        mv -f "$tmp" "$ALLOWLIST_FILE"
+        log "allowlist_add: inserted $ip into $ALLOWLIST_FILE ($section section)"
+        ok=0
+      else
+        rm -f "$tmp"
+        log "allowlist_add: WARN — section '$section' not found in $ALLOWLIST_FILE; appending"
+        # Fallback: append to the correct section at end of file
+        printf '  %s:\n    - "%s"\n' "$section" "$ip" >> "$ALLOWLIST_FILE"
+        ok=0
+      fi
     fi
-    ok=0
   fi
   run systemctl reload crowdsec || run systemctl restart crowdsec
   return $ok

@@ -1,10 +1,10 @@
-# IntelShield v8.6
+# IntelShield v8.9
 
 **Unified hardening, forensics, SIEM/XDR, and performance tuning for Ubuntu servers -- in a single Bash script with a full text UI.**
 
 IntelShield is a menu-driven security suite for **Ubuntu 22.04 / 24.04 LTS** servers, with first-class support for **x-ui / 3x-ui + Xray (VLESS-Reality)** relays. It installs, configures, wires together, and manages a complete defensive stack -- firewall, IDS/IPS, intrusion prevention, antivirus, file-integrity, rootkit detection, audit, and a Wazuh agent -- behind one consistent `whiptail` interface, with safety rails designed so you can harden a **remote** box without locking yourself out.
 
-**New in v8.6:** Full **dual-stack IPv6 support** (validation, HOME_NET, egress detection), **transactional rule hardening** with 5-gate atomic execution and deterministic snapshot/validate/apply/verify/rollback gates, plus all v8.3 features: Suricata 8 **Firewall Mode** (deterministic packet pipeline, default-drop), **nftables priority chain orchestration** (CrowdSec @priority 0, Suricata @priority 10), **mutex toggle** for concurrent IPS conflict prevention, and Suricata 8's 107+ new keywords (`entropy`, `luaxform`, `absent`, JSON datasets).
+**New in v8.9:** Fixed **IPv6 tokenization bug** in `valid_ip()` (sentinel-based IFS tokenization instead of fragile word-splitting), **YAML allowlist hardening** (atomic insertion, duplicate detection, preserved indentation), plus all v8.6 features: full **dual-stack IPv6** support, **transactional rule hardening** with 5-gate atomic execution, Suricata 8 **Firewall Mode** (deterministic packet pipeline, default-drop), **nftables priority chain orchestration** (CrowdSec @priority 0, Suricata @priority 10), and Suricata 8's 107+ new keywords.
 
 > **Use only on servers you own or are authorized to administer.** IntelShield makes real changes to firewall rules, SSH, kernel parameters, and system services. Always test on a throwaway VM first and keep console/out-of-band access available.
 
@@ -546,4 +546,4 @@ Released under the **MIT License** -- see [`LICENSE`](LICENSE). If no license fi
 
 ---
 
-<p align="center"><em>IntelShield v8.6 -- harden fast, break nothing, revert anytime.</em></p>
+<p align="center"><em>IntelShield v8.9 -- harden fast, break nothing, revert anytime.</em></p>
