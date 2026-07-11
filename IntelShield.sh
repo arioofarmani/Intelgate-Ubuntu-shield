@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #==============================================================================
-#  IntelShield v9.5  —  Unified Hardening · Forensics · SIEM/XDR · Performance
+#  IntelShield v9.8  —  Unified Hardening · Forensics · SIEM/XDR · Performance · OS-Aware Immutability · Audit-Hardened
 #  Target : Ubuntu 22.04 / 24.04 LTS server
 #  Lineage: intelshield v2.5 (rich UI base) + IntelShield-AllInOne v1.3.1 (extras)
 #           v3.0 adds Suricata inline IPS (+ CrowdSec coexistence), rule selection,
-#           a toggleable x-ui/Xray sandbox, and a granular component control center.
+#           and a granular component control center.
 #           v4.0 adds atomic self-healing Suricata rule updates and kernel/engine
 #           unattended-upgrade isolation.
 #           v5.0 reverts v4.0's hand-built CrowdSec repo (which could break apt-get
@@ -75,7 +75,7 @@
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-APP="IntelShield"; VERSION="9.5"
+APP="IntelShield"; VERSION="9.9"
 LOG="/var/log/intelshield.log"
 BT="IntelShield v${VERSION} | Hardening · Forensics · SIEM/XDR · Performance"
 
@@ -99,7 +99,7 @@ SURICATA_IPS_PRIORITY=100
 # --- immutability engine (v9.5) ----------------------------------------------
 IMMUTABLE_PATHS=("/bin" "/sbin" "/usr" "/boot")
 IMMUTABLE_FILES=("/etc/passwd" "/etc/shadow" "/etc/fstab" "/etc/group" "/etc/gshadow" "/etc/sudoers")
-IMMUTABLE_EXCLUDES=("/var/log" "/var/run" "/var/tmp" "/tmp" "/proc" "/sys" "/dev" "/run" "$STATE_DIR" "/etc/resolv.conf" "/etc/hostname")
+IMMUTABLE_EXCLUDES=("/var/log" "/var/run" "/var/tmp" "/tmp" "/proc" "/sys" "/dev" "/run" "$STATE_DIR" "/etc/resolv.conf" "/etc/hostname" "/usr/local/sbin")
 
 # --- crowdsec / suricata -----------------------------------------------------
 ALLOWLIST_FILE="/etc/crowdsec/parsers/s02-enrich/00-admin-allowlist.yaml"
@@ -134,17 +134,11 @@ SURICATA_FW_CHAIN="intelshield_suricata_fw"
 #   CrowdSec bouncer:  priority 0   (edge — cheap IP-reputation drops)
 #   Suricata FW mode:  priority 10  (deep packet inspection, deterministic pipeline)
 #   Suricata IPS mode: priority 100 (legacy inline NFQUEUE, kept for compat)
-SURICATA_FW_PRIORITY=10
-SURICATA_CROWDSEC_PRIORITY=0
 # Mutex state: prevents enabling both CrowdSec bouncer AND Suricata FW mode
 # when concurrent execution constraints exist (only one can own the packet path)
 SURICATA_MUTEX_FILE="${STATE_DIR}/suricata-fw-mutex"     # 'crowdsec' | 'suricata' | 'none'
 # Suricata 8 rule management: transactional rules + new keywords
 SURICATA_DATASETS_DIR="/var/lib/suricata/datasets"
-
-# --- x-ui / Xray systemd sandbox --------------------------------------------
-SANDBOX_DROPIN_NAME="99-intelshield-sandbox.conf"
-SANDBOX_MDWE_FILE="${STATE_DIR}/sandbox-mdwe"             # 'on' | 'off' (default off for x-ui compatibility)
 
 # --- update center -----------------------------------------------------------
 UPGRADE_BLACKLIST="/etc/apt/apt.conf.d/51intelshield-blacklist"   # kernel/engine auto-upgrade guard
@@ -155,6 +149,8 @@ AUTO_REBOOT_TIME="01:11"
 MAINT_LOG="/var/log/intelshield-maintenance.log"       # dedicated cron audit trail
 MAINT_CRON="/etc/cron.d/intelshield-maintenance"       # opt-in; written ONLY from the menu
 MAINT_LOCK="/run/intelshield-maintenance.lock"         # flock guard: one run at a time
+GLOBAL_LOCK="/run/intelshield-global.lock"             # H2-15: global entry-point flock
+SURI_RULES_LOCK="/run/intelshield-suricata-rules.lock" # H2-16: suricata rule update flock
 MAINT_LOGROTATE="/etc/logrotate.d/intelshield-maintenance"
 UPDATE_CONF="/etc/intelshield/update.conf"             # optional UPDATE_URL= override
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/arioofarmani/Intelgate-Ubuntu-shield/main/IntelShield.sh"
@@ -200,7 +196,7 @@ WAZUH_HELPER="/usr/local/bin/intelshieldctl-wazuh"
 WAZUH_AR_SCRIPT="/var/ossec/active-response/bin/intelshield-safe-response.sh"
 
 # --- runtime discovery (populated by preflight) ------------------------------
-OS_DESC=""; OS_CODENAME=""; NIC=""; PUB_IP=""; SSH_PORT="22"; SSH_CLIENT_IP=""; PANEL_PORT=""
+OS_DESC=""; OS_CODENAME=""; NIC=""; PUB_IP=""; SSH_PORT="22"; SSH_CLIENT_IP=""
 
 declare -A RESULT
 declare -a TARGETS
@@ -280,11 +276,47 @@ chmod 600 "$LOG" "$WAZUH_LOG" "$MAINT_LOG" 2>/dev/null || true
 # --- private scratch dir (replaces predictable /tmp/.ea_* report files) -------
 IS_TMP="$(mktemp -d /run/intelshield.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/intelshield.XXXXXX")"
 chmod 700 "$IS_TMP" 2>/dev/null || true
-trap 'rm -rf "$IS_TMP" 2>/dev/null' EXIT
+cleanup(){ rm -rf "$IS_TMP" 2>/dev/null; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+# M2-5 fix: HUP is the most common abnormal termination for SSH sessions.
+# Untrapped HUP skips the EXIT trap, leaking IS_TMP and leaving partial state.
+trap 'cleanup; exit 129' HUP
+
+# H2-15 fix: global flock to serialize TUI, cron, and timers against shared state.
+# Usage: global_lock [exclusive|shared] — exclusive for mutations, shared for reads.
+# Returns 0 if lock acquired, 1 if another run holds it.
+GLOBAL_LOCK_FD=9
+global_lock(){
+  local mode="${1:-exclusive}"
+  local lockfile="$GLOBAL_LOCK"
+  case "$mode" in
+    exclusive) flock -n $GLOBAL_LOCK_FD 2>/dev/null <"$lockfile" && return 0 ;;
+    shared)    flock -sn $GLOBAL_LOCK_FD 2>/dev/null <"$lockfile" && return 0 ;;
+  esac
+  return 1
+}
+# H2-16 fix: dedicated lock for suricata rule updates
+SURI_RULES_FD=8
+suri_rules_lock(){
+  flock -n $SURI_RULES_FD 2>/dev/null <"$SURI_RULES_LOCK" && return 0
+  return 1
+}
+
+# M2-17 fix: atomic writes for small state files to prevent torn reads under concurrency.
+atomic_state_write(){
+  local target="$1" value="$2" dir
+  dir="$(dirname "$target")"
+  local tmp="${target}.tmp.$$"
+  printf '%s\n' "$value" >"$tmp" && mv -f "$tmp" "$target"
+}
 
 
 # ---------- core helpers -----------------------------------------------------
-log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+# M2-9 fix: strip control characters to prevent log injection via crafted filenames/rule msgs
+log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$(printf '%s' "$*" | tr -d '\r' | sed 's/[[:cntrl:]]/?/g')" >>"$LOG"; }
+log_err(){ log "ERROR: $*"; }
 # EXECUTION-WRAPPER CONTRACT (relied on by every install/update/rollback path):
 # run() and run_capture() ALWAYS merge stderr into the captured/streamed output
 # and ALWAYS return the wrapped command's REAL exit code — in live mode via
@@ -312,6 +344,19 @@ run_capture(){
   fi
   "$@" </dev/null >"$out" 2>&1
 }
+# apt_do(): THE single entry point for every apt/dpkg write operation.
+# Owns: (1) immutability unlock/relock, (2) dpkg lock timeout, (3) run() wrapper.
+# C2-1/C2-2/C2-3 fix: every apt call MUST go through apt_do, never raw apt-get.
+apt_do(){
+  local relock=0
+  ensure_unlocked_for_apt && relock=1
+  run apt-get -o "$APT_LOCK_OPT" "$@"
+  local rc=$?
+  (( relock )) && system_lock
+  return $rc
+}
+# Legacy alias — callers that used the old apt_get wrapper now route through apt_do.
+apt_get(){ apt_do "$@"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 have_cs(){ command -v cscli >/dev/null 2>&1; }
 rkhunter_present(){ have rkhunter; }
@@ -331,19 +376,8 @@ svc_enabled(){ local s; s="$(systemctl is-enabled "$1" 2>/dev/null)"; printf '%s
 # restart again, and return 1. Used by the maintenance engine, Suricata rule
 # updates and the config drop-in writers so a bad update can never leave a
 # critical service down.
-restart_or_rollback(){
-  local unit="$1" rollback="${2:-}"
-  run systemctl restart "$unit"; sleep 2
-  systemctl is-active --quiet "$unit" && return 0
-  log "ALERT: $unit failed to restart after update — rolling back to previous state"
-  [[ -n "$rollback" ]] && "$rollback"
-  run systemctl restart "$unit" || true
-  if systemctl is-active --quiet "$unit"; then log "$unit recovered after rollback"
-  else log "ALERT: $unit is STILL down after rollback — manual intervention required"; fi
-  return 1
-}
 # canonical self-install so timers/cron never reference a moved or space-laden path
-install_self(){ local dst=/usr/local/sbin/intelshield src; src="$(readlink -f "$0" 2>/dev/null || echo "$0")"; if [[ "$src" != "$dst" ]]; then install -m 750 "$src" "$dst" 2>/dev/null || { printf '%s' "$src"; return 0; }; fi; printf '%s' "$dst"; }
+install_self(){ local dst=/usr/local/sbin/intelshield src; src="$(readlink -f "$0" 2>/dev/null || echo "$0")"; if [[ "$src" != "$dst" ]]; then install -m 750 "$src" "$dst" 2>/dev/null || { log "FATAL: install_self: cannot install to $dst (immutable /usr? disk full?)"; printf '%s' "$src"; return 1; }; fi; printf '%s' "$dst"; }
 
 
 #==============================================================================
@@ -352,41 +386,12 @@ install_self(){ local dst=/usr/local/sbin/intelshield src; src="$(readlink -f "$
 # Global chattr +i toggle for critical system paths.
 # Uses bulk find + xargs for O(1) performance (no per-file bash loops).
 
-# Check if a path is in the exclusion list
-_is_excluded(){
-  local path="$1" excl
-  for excl in "${IMMUTABLE_EXCLUDES[@]}"; do
-    [[ "$path" == "$excl" || "$path" == "$excl/"* ]] && return 0
-  done
-  return 1
-}
-
-# Apply chattr +i to a single path (file or directory).
-# Uses lsattr -d (inspect dir itself, not contents) + awk to extract flag field.
-_lock_path(){
-  local path="$1"
-  [[ -e "$path" ]] || return 0
-  [[ -L "$path" ]] && return 0
-  _is_excluded "$path" && return 0
-  # lsattr output: ----i---------e------- /path
-  if ! lsattr -d "$path" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-    chattr +i "$path" 2>/dev/null || log "WARN: could not lock $path"
-  fi
-}
-
-# Remove chattr -i from a single path
-_unlock_path(){
-  local path="$1"
-  [[ -e "$path" ]] || return 0
-  [[ -L "$path" ]] && return 0
-  chattr -i "$path" 2>/dev/null || true
-}
-
 # Lock the entire system — bulk find + xargs for performance.
 # No per-file bash loops; excludes are pruned natively by find.
 system_lock(){
-  local path start_ts excl_args=() excl
+  local path start_ts excl_args=() excl locked=0 rc=0
   start_ts="$(date +%s)"
+  atomic_state_write "$LOCK_STATE_FILE" "LOCKING"
   log "system_lock: beginning immutability lockdown"
   # Build find -prune args for excluded paths
   for excl in "${IMMUTABLE_EXCLUDES[@]}"; do
@@ -395,20 +400,39 @@ system_lock(){
   # Lock directories in bulk via find + xargs -0
   for path in "${IMMUTABLE_PATHS[@]}"; do
     [[ -d "$path" ]] || continue
+    # Check filesystem type — chattr only works on ext2/3/4, btrfs, xfs
+    local fst; fst="$(stat -f -c %T "$path" 2>/dev/null)"
+    case "$fst" in
+      ext2/ext3|ext4|btrfs|xfs) ;;
+      *) log "WARN: system_lock: $path is on '$fst' — chattr +i unsupported, SKIPPING"; continue ;;
+    esac
     log "system_lock: bulk locking $path"
-    find "$path" -xdev ! -type l \( "${excl_args[@]}" -print0 \) 2>/dev/null | \
-      xargs -0 -r chattr +i 2>>"$LOG" || true
+    find "$path" -xdev \( -fstype ext2 -o -fstype ext3 -o -fstype ext4 -o -fstype btrfs -o -fstype xfs \) ! -type l \( "${excl_args[@]}" -print0 \) 2>/dev/null | \
+      xargs -0 -r chattr +i 2>>"$LOG"
+    local pipe_rc=${PIPESTATUS[1]:-0}
+    case "$pipe_rc" in
+      0)   locked=1 ;;
+      123) log "WARN: system_lock: chattr failed on some files under $path"; rc=1; locked=1 ;;
+      *)   log "ERROR: system_lock: chattr sweep failed for $path"; rc=1 ;;
+    esac
   done
   # Lock individual files
   for path in "${IMMUTABLE_FILES[@]}"; do
     [[ -f "$path" ]] || continue
-    chattr +i "$path" 2>/dev/null || log "WARN: could not lock $path"
+    chattr +i "$path" 2>/dev/null && locked=1 || log "WARN: could not lock $path"
   done
-  echo "LOCKED" >"$LOCK_STATE_FILE"
+  if (( locked )); then
+    atomic_state_write "$LOCK_STATE_FILE" "LOCKED"
+  else
+    atomic_state_write "$LOCK_STATE_FILE" "UNLOCKED"
+    log "ERROR: system_lock: locked nothing"
+    return 1
+  fi
   log "system_lock: completed in $(( $(date +%s) - start_ts ))s"
+  return $rc
 }
 
-# Unlock the entire system — bulk find -depth + xargs for performance.
+# Unlock the entire system — bulk find + xargs for performance.
 system_unlock(){
   local path start_ts excl_args=() excl
   start_ts="$(date +%s)"
@@ -420,14 +444,14 @@ system_unlock(){
   for path in "${IMMUTABLE_PATHS[@]}"; do
     [[ -d "$path" ]] || continue
     log "system_unlock: bulk unlocking $path"
-    find "$path" -xdev -depth ! -type l \( "${excl_args[@]}" -print0 \) 2>/dev/null | \
+    find "$path" -xdev \( -fstype ext2 -o -fstype ext3 -o -fstype ext4 -o -fstype btrfs -o -fstype xfs \) ! -type l \( "${excl_args[@]}" -print0 \) 2>/dev/null | \
       xargs -0 -r chattr -i 2>>"$LOG" || true
   done
   for path in "${IMMUTABLE_FILES[@]}"; do
     [[ -f "$path" ]] || continue
     chattr -i "$path" 2>/dev/null || true
   done
-  echo "UNLOCKED" >"$LOCK_STATE_FILE"
+  atomic_state_write "$LOCK_STATE_FILE" "UNLOCKED"
   log "system_unlock: completed in $(( $(date +%s) - start_ts ))s"
 }
 
@@ -444,6 +468,18 @@ count_immutable(){
     count=$(( count + $(lsattr -R -d "$path" 2>/dev/null | awk '{print $1}' | grep -c 'i') ))
   done
   printf '%d' "$count"
+}
+
+# Guard: auto-unlock for apt operations if immutability is active.
+# Logs the unlock and returns a command to re-lock after the operation.
+ensure_unlocked_for_apt(){
+  local status; status="$(get_lock_status)"
+  if [[ "$status" == "LOCKED" || "$status" == "LOCKING" ]]; then
+    log "ensure_unlocked_for_apt: auto-unlocking for package operation (was: $status)"
+    system_unlock
+    return 0  # caller should re-lock after apt operations
+  fi
+  return 1  # already unlocked, nothing to do
 }
 
 
@@ -481,29 +517,22 @@ deploy_nft_pipeline(){
 # IntelShield v${VERSION} nftables pipeline — $(date -u '+%F %T')
 # Priority: CrowdSec=${cs_prio}, Suricata=${suri_prio}, SSH excluded
 table inet intelshield_pipeline {
-    set ssh_ratelimit { type ipv4_addr; flags dynamic,timeout; timeout 60s; }
     chain input {
         type filter hook input priority ${suri_prio}; policy accept;
         iif "lo" accept
-        tcp dport ${ssh_port} ct state new add @ssh_ratelimit { ip saddr limit rate 5/minute burst 3 packets } accept
-        tcp dport ${ssh_port} ct state new add @ssh_ratelimit { ip saddr limit rate 15/minute burst 5 packets } drop
+        # SSH bypass — never queue SSH, v4 or v6
+        tcp dport ${ssh_port} ct state new accept
+        tcp dport ${ssh_port} ct state established,related accept
         ct state established,related accept
         ip protocol icmp limit rate 10/second accept
         ip6 nexthdr icmpv6 limit rate 10/second accept
 NFTEOF
-  case "$mode" in
-    fw|ips)
-      local ncpu qmax; ncpu=$(nproc 2>/dev/null || echo 1); qmax=$((ncpu-1)); (( qmax>3 )) && qmax=3; (( qmax<0 )) && qmax=0
-      cat >>"$ruleset" <<NFTEOF
-        meta l4proto { tcp, udp } queue num 0-${qmax} flags bypass,fanout
-NFTEOF
-      ;;
-    *)
-      cat >>"$ruleset" <<NFTEOF
+  # M2-19 fix: this pipeline table is a lightweight pass-through. The actual
+  # queueing/dropping lives in intelshield_ips@100. The pipeline provides SSH
+  # bypass, ICMP rate-limiting, and conntrack for traffic that doesn't hit IPS.
+  cat >>"$ruleset" <<NFTEOF
         meta l4proto { tcp, udp } accept
 NFTEOF
-      ;;
-  esac
   cat >>"$ruleset" <<NFTEOF
     }
     chain output {
@@ -535,13 +564,6 @@ nft_sync(){
   deploy_nft_pipeline "$CROWDSEC_PRIORITY" "$SURICATA_FW_PRIORITY" "${STATE_SSH_PORT:-22}" "$mode"
 }
 
-# UFW Survivability: re-sync nftables after any UFW reload/restart
-ufw_nft_resync_hook(){
-  log "ufw_nft_resync_hook: UFW state changed, re-syncing nftables pipeline"
-  nft_sync 2>/dev/null || log "ufw_nft_resync_hook: nft_sync failed"
-}
-
-
 #==============================================================================
 #  RFC-8259 STATE & SIEM ENGINE (v9.5)
 #==============================================================================
@@ -555,7 +577,7 @@ _collect_state(){
   STATE_VIRT="$(systemd-detect-virt 2>/dev/null || echo none)"
   STATE_NIC="${NIC:-$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')}"
   STATE_PUB_IP="${PUB_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')}"
-  [[ -z "$STATE_PUB_IP" ]] && STATE_PUB_IP="$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null || echo unknown)"
+  [[ -z "$STATE_PUB_IP" ]] && STATE_PUB_IP="$(curl -fsS4 --proto '=https' --tlsv1.2 --max-time 5 https://ifconfig.me 2>/dev/null || echo unknown)"
   STATE_SSH_PORT="${SSH_PORT:-22}"
   STATE_ADMIN_SSH="${SSH_CLIENT_IP:-false}"
   # Security
@@ -577,6 +599,8 @@ _collect_state(){
   STATE_MAINT_CRON="disabled"; [[ -f "$MAINT_CRON" ]] && STATE_MAINT_CRON=enabled
   STATE_WAZUH="$(svc_state wazuh-agent)"
   STATE_WAZUH_MANAGER="$(grep -m1 '<address>' "$WAZUH_OSSEC" 2>/dev/null | sed -E 's/.*<address>([^<]+)<\/address>.*/\1/' || true)"
+  STATE_WAZUH_BLOCK=false; grep -q 'INTELSHIELD-WAZUH-MANAGED-START' "$WAZUH_OSSEC" 2>/dev/null && STATE_WAZUH_BLOCK=true
+  STATE_WAZUH_AR=false; [[ -x "$WAZUH_AR_SCRIPT" ]] && STATE_WAZUH_AR=true
   # Anti-rootkit
   STATE_ARK="rkhunter=$(rkhunter_present&&echo installed||echo missing), chkrootkit=$(chkrootkit_present&&echo installed||echo missing)"
   # Resources
@@ -624,6 +648,8 @@ state_write(){
     --arg maintenance_cron "$STATE_MAINT_CRON" \
     --arg wazuh_agent "$STATE_WAZUH" \
     --arg wazuh_manager "$STATE_WAZUH_MANAGER" \
+    --argjson wazuh_block "$STATE_WAZUH_BLOCK" \
+    --argjson wazuh_ar "$STATE_WAZUH_AR" \
     --arg anti_rootkit "$STATE_ARK" \
     --argjson memory_mb "${STATE_MEM_MB:-0}" \
     --argjson root_free_mb "${STATE_DISK_MB:-0}" \
@@ -636,8 +662,9 @@ state_write(){
       host: { hostname: $hostname, kernel: $kernel, uptime: $uptime, os: $os, virt: $virt, nic: $nic, public_ip: $pub_ip, ssh_port: $ssh_port, admin_ssh: $admin_ssh },
       security: { secure_boot: $secure_boot, kernel_lockdown: $kernel_lockdown, apparmor: $apparmor, ufw: $ufw, mitigations_off: $mitigations_off },
       immutability: { state: $lock_state, immutable_count: $immutable_count },
-      services: { crowdsec: $crowdsec, bouncer: $bouncer, suricata: $suricata, suricata_mode: $suricata_mode, suricata_fw_mode: $suricata_fw, suricata_mutex: $suricata_mutex, clamav_freshclam: $clamav, auditd: $auditd, maintenance_cron: $maintenance_cron, wazuh_agent: $wazuh_agent, wazuh_manager: $wazuh_manager },
+      services: { crowdsec: $crowdsec, bouncer: $bouncer, suricata: $suricata, suricata_mode: $suricata_mode, suricata_fw_mode: $suricata_fw, suricata_mutex: $suricata_mutex, clamav_freshclam: $clamav, auditd: $auditd, maintenance_cron: $maintenance_cron },
       anti_rootkit: $anti_rootkit,
+      wazuh: { mode: "agent", agent_status: $wazuh_agent, manager: $wazuh_manager, intelshield_log_forwarding: $wazuh_block, active_response_safe_mode: $wazuh_ar },
       resources: { memory_mb: $memory_mb, root_free_mb: $root_free_mb, load_avg: $load_avg },
       vpn: { port_443_listening: $port_443 },
       profile: $profile
@@ -671,23 +698,41 @@ state_export_siem(){
 # Replace v8.9's restart_or_rollback with v9.3 version
 restart_or_rollback(){
   local unit="$1" rollback_fn="${2:-}"
-  local rc=0
+  local rc=0 deadline
   log "restart_or_rollback: restarting $unit"
   systemctl restart "$unit" >>"$LOG" 2>&1 || rc=$?
-  sleep 2
-  if systemctl is-active --quiet "$unit" 2>/dev/null; then
-    log "restart_or_rollback: $unit is active"; return 0
-  fi
+  # Bounded poll: wait up to 120s for the unit to settle, checking real state
+  deadline=$(( SECONDS + 120 ))
+  while (( SECONDS < deadline )); do
+    case "$(systemctl show -p ActiveState --value "$unit" 2>/dev/null)" in
+      active)
+        systemctl is-active --quiet "$unit" 2>/dev/null && { log "restart_or_rollback: $unit active"; return 0; }
+        ;;
+      failed) break ;;
+      activating|deactivating|reloading) ;;
+      *) break ;;
+    esac
+    sleep 2
+  done
   log "restart_or_rollback: $unit failed (rc=$rc) — executing rollback"
   if [[ -n "$rollback_fn" ]] && declare -f "$rollback_fn" >/dev/null 2>&1; then
     "$rollback_fn"
   elif [[ -n "$rollback_fn" ]] && [[ -x "$rollback_fn" ]]; then
     "$rollback_fn"
   fi
-  systemctl restart "$unit" >>"$LOG" 2>&1 || true; sleep 2
-  if systemctl is-active --quiet "$unit" 2>/dev/null; then
-    log "restart_or_rollback: $unit recovered after rollback"; return 0
-  fi
+  systemctl restart "$unit" >>"$LOG" 2>&1 || true
+  deadline=$(( SECONDS + 60 ))
+  while (( SECONDS < deadline )); do
+    case "$(systemctl show -p ActiveState --value "$unit" 2>/dev/null)" in
+      active)
+        systemctl is-active --quiet "$unit" 2>/dev/null && { log "restart_or_rollback: $unit recovered after rollback"; return 0; }
+        ;;
+      failed) break ;;
+      activating|deactivating|reloading) ;;
+      *) break ;;
+    esac
+    sleep 2
+  done
   log "restart_or_rollback: $unit is STILL down after rollback"; return 1
 }
 
@@ -702,7 +747,7 @@ rollback_suricata_fw(){
   nft_teardown; rm -f /etc/systemd/system/suricata.service.d/99-intelshield-fw.conf 2>/dev/null
   systemctl daemon-reload >>"$LOG" 2>&1 || true
   echo "off" >"$SURICATA_FW_MODE_FILE" 2>/dev/null || true
-  echo "none" >"$SURICATA_MUTEX_FILE" 2>/dev/null || true
+  atomic_state_write "$SURICATA_MUTEX_FILE" "none" 2>/dev/null || true
 }
 
 rollback_nft_pipeline(){
@@ -716,7 +761,7 @@ rollback_nft_pipeline(){
 # Write a systemd drop-in so UFW reloads auto-resync the nftables pipeline.
 ufw_install_resync_hook(){
   local dropin="/etc/systemd/system/ufw.service.d/99-intelshield-resync.conf"
-  local self; self="$(install_self)"
+  local self; self="$(install_self)" || { log "WARN: install_self failed — using ad-hoc path"; self="$0"; }
   mkdir -p "$(dirname "$dropin")"
   cat >"$dropin" <<EOF
 # IntelShield: re-sync nftables pipeline after UFW state changes
@@ -801,6 +846,10 @@ valid_ip(){
     ngroups="${#ngroups}"
     # A valid IPv6 has 7 colons (8 groups) or 1-6 colons if :: is present
     if [[ "$addr" == *"::"* ]]; then
+      # M2-6 fix: RFC 4291 requires :: at most once
+      local _test="${addr}" _count=0
+      while [[ "$_test" == *'::'* ]]; do _test="${_test#*::}"; (( _count++ )); done
+      (( _count <= 1 )) || return 1
       # With :: — must have <= 6 colons (at least 2 groups implied by ::)
       (( ngroups <= 6 )) || return 1
     else
@@ -840,14 +889,19 @@ valid_ip(){
   (( 10#"$cidr" >= 0 && 10#"$cidr" <= 128 )) || return 1
   return 0
 }
-valid_port(){ local p="$1" a b; if [[ "$p" =~ ^[0-9]{1,5}$ ]]; then (( p>=1 && p<=65535 )); return $?; fi; if [[ "$p" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; (( a>=1 && a<=65535 && b>=1 && b<=65535 && a<b )); return $?; fi; return 1; }
+valid_port(){ local p="$1" a b; if [[ "$p" =~ ^[0-9]{1,5}$ ]]; then (( 10#"$p">=1 && 10#"$p"<=65535 )); return $?; fi; if [[ "$p" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; (( 10#"$a">=1 && 10#"$a"<=65535 && 10#"$b">=1 && 10#"$b"<=65535 && 10#"$a"<10#"$b" )); return $?; fi; return 1; }
 
 # ---------- preflight environment + architecture discovery -------------------
 preflight(){
-  command -v whiptail >/dev/null 2>&1 || { apt-get update -y >>"$LOG" 2>&1; apt-get install -y whiptail >>"$LOG" 2>&1; }
+  command -v whiptail >/dev/null 2>&1 || { apt_do update -y; apt_do install -y whiptail; }
+  if ! command -v whiptail >/dev/null 2>&1; then
+    UI=0
+    log "FATAL: whiptail unavailable and could not be installed — TUI disabled"
+    (( NONINTERACTIVE )) || { echo "whiptail is required for the TUI. Install it, or use the headless flags (--help)." >&2; exit 1; }
+  fi
   local p
   for p in curl ca-certificates gnupg lsb-release tar gzip iproute2 procps util-linux jq; do
-    dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" >>"$LOG" 2>&1
+    dpkg -s "$p" >/dev/null 2>&1 || apt_do install -y "$p"
   done
   OS_DESC="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
   OS_CODENAME="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
@@ -862,15 +916,36 @@ preflight(){
   [[ -z "$NIC" ]] && NIC="$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}')"
   # Dual-stack: prefer IPv4 egress (Suricata HOME_NET is simpler), but detect IPv6 too
   PUB_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-  [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)"
+  [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -fsS4 --proto '=https' --tlsv1.2 --max-time 5 https://ifconfig.me 2>/dev/null)"
+  valid_ip "$PUB_IP" || { log "WARN: egress IPv4 lookup returned invalid value — ignoring"; PUB_IP=""; }
   # If no IPv4, try IPv6
   if [[ -z "$PUB_IP" ]]; then
     PUB_IP="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)"
+    [[ -z "$PUB_IP" ]] && PUB_IP="$(curl -fsS6 --proto '=https' --tlsv1.2 --max-time 5 https://ifconfig.me 2>/dev/null)"
+    valid_ip "$PUB_IP" || { log "WARN: egress IPv6 lookup returned invalid value — ignoring"; PUB_IP=""; }
   fi
   SSH_CLIENT_IP="${SSH_CONNECTION%% *}"
   [[ -z "$SSH_CLIENT_IP" ]] && SSH_CLIENT_IP="$(who am i 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')"
-  PANEL_PORT="$(ss -tlnp 2>/dev/null | awk '/x-ui|3x-ui/{n=split($4,a,":"); print a[n]}' | head -1)"
+  immutability_os_exclusions
+}
+
+# Append OS-specific paths to IMMUTABLE_EXCLUDES to prevent ioctl crashes,
+# snapd corruption, and DHCP lease breakage on Ubuntu.
+immutability_os_exclusions(){
+  case "$OS_CODENAME" in
+    jammy|noble)
+      # FAT32/vfat /boot/efi → "Inappropriate ioctl for device" kernel errors
+      [[ -d "/boot/efi" ]] && IMMUTABLE_EXCLUDES+=("/boot/efi")
+      # snapd background updater → package corruption if snap dirs are immutable
+      IMMUTABLE_EXCLUDES+=("/usr/lib/snapd" "/snap")
+      # DHCP lease renewals on Noble → network connectivity loss
+      IMMUTABLE_EXCLUDES+=("/etc/netplan" "/run/systemd/network")
+      log "immutability_os_exclusions: Ubuntu ${OS_CODENAME} — appended /boot/efi, /snap, /snapd, /etc/netplan, /run/systemd/network"
+      ;;
+    *)
+      log "immutability_os_exclusions: non-Ubuntu or unknown codename '${OS_CODENAME:-?}' — using base exclusions only"
+      ;;
+  esac
 }
 
 
@@ -920,8 +995,8 @@ YAML
       while IFS= read -r line; do
         printf '%s\n' "$line"
         # Insert after the section header (e.g. "  ip:" or "  cidr:")
-        if [[ "$wrote" -eq 0 && "$line" =~ ^[[:space:]]${section}:$ ]]; then
-          printf '    - "%s"\n' "$ip"
+        if [[ "$wrote" -eq 0 && "$line" =~ ^([[:space:]]*)${section}:[[:space:]]*$ ]]; then
+          printf '%s  - "%s"\n' "${BASH_REMATCH[1]}" "$ip"
           found=1; wrote=1
         fi
       done < "$ALLOWLIST_FILE" > "$tmp"
@@ -943,31 +1018,12 @@ YAML
 }
 
 
-# ---------- JSON state database ---------------------------------------------
-state_write(){
-  mkdir -p "$STATE_DIR"
-  local virt sb lock app ufwst profile suri suri_mode crowd bouncer clam audit ark mem disk mitig port443 panel_public xray xui wazuh_active wazuh_manager wazuh_block wazuh_ar maintcron
-  virt=$(systemd-detect-virt 2>/dev/null || echo none); sb=$(mokutil --sb-state 2>/dev/null | tr '\n' ' ' || echo unknown); lock=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable); app=$(svc_state apparmor)
-  ufwst=$(ufw status 2>/dev/null | head -1 | sed 's/Status: //'); [[ -z "$ufwst" ]] && ufwst=missing; profile=$(cat "$PROFILE_FILE" 2>/dev/null || echo none)
-  suri=$(svc_state suricata); crowd=$(svc_state crowdsec); bouncer=$(svc_state crowdsec-firewall-bouncer); clam=$(svc_state clamav-freshclam); audit=$(svc_state auditd); xui=$(svc_state x-ui); xray=$(svc_state xray); suri_mode=$(cat "$SURICATA_MODE_FILE" 2>/dev/null || echo ids); suri_fw=$(cat "$SURICATA_FW_MODE_FILE" 2>/dev/null || echo off); suri_mutex=$(cat "$SURICATA_MUTEX_FILE" 2>/dev/null || echo none)
-  mem=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0); disk=$(df -Pm / | awk 'NR==2{print $4}' 2>/dev/null || echo 0); grep -qw mitigations=off /proc/cmdline && mitig=true || mitig=false
-  ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq '(:|\])443$' && port443=true || port443=false; panel_public=false; [[ -n "${PANEL_PORT:-}" ]] && ss -tln 2>/dev/null | grep -E "(0\.0\.0\.0|\[::\]|\*)[:.]${PANEL_PORT}\b" >/dev/null && panel_public=true
-  ark="rkhunter=$(rkhunter_present&&echo installed||echo missing), chkrootkit=$(chkrootkit_present&&echo installed||echo missing)"
-  wazuh_active=$(svc_state wazuh-agent); wazuh_manager=$(grep -m1 '<address>' "$WAZUH_OSSEC" 2>/dev/null | sed -E 's/.*<address>([^<]+)<\/address>.*/\1/' || true); grep -q 'INTELSHIELD-WAZUH-MANAGED-START' "$WAZUH_OSSEC" 2>/dev/null && wazuh_block=true || wazuh_block=false; [[ -x "$WAZUH_AR_SCRIPT" ]] && wazuh_ar=true || wazuh_ar=false
-  maintcron=disabled; [[ -f "$MAINT_CRON" ]] && maintcron=enabled
-  # write atomically so a Wazuh json tail never reads a half-written file
-  cat >"${STATE_DB}.tmp" <<EOF
-{"version":"$VERSION","updated_at":"$(date -Is)","profile":"$(json_escape "$profile")","host":{"os":"$(json_escape "${OS_DESC:-}")","virt":"$(json_escape "$virt")","nic":"$(json_escape "${NIC:-}")","public_ip":"$(json_escape "${PUB_IP:-}")","ssh_port":"$(json_escape "${SSH_PORT:-}")","admin_ssh":$([[ -n "${SSH_CONNECTION:-}" ]] && echo true || echo false)},"security":{"secure_boot":"$(json_escape "$sb")","kernel_lockdown":"$(json_escape "$lock")","apparmor":"$(json_escape "$app")","ufw":"$(json_escape "$ufwst")","mitigations_off":$mitig},"services":{"crowdsec":"$(json_escape "$crowd")","bouncer":"$(json_escape "$bouncer")","suricata":"$(json_escape "$suri")","suricata_mode":"$(json_escape "$suri_mode")","suricata_fw_mode":"$(json_escape "$suri_fw")","suricata_mutex":"$(json_escape "$suri_mutex")","clamav_freshclam":"$(json_escape "$clam")","auditd":"$(json_escape "$audit")","xui":"$(json_escape "$xui")","xray":"$(json_escape "$xray")","maintenance_cron":"$(json_escape "$maintcron")"},"anti_rootkit":"$(json_escape "$ark")","wazuh":{"mode":"agent","agent_status":"$(json_escape "$wazuh_active")","manager":"$(json_escape "$wazuh_manager")","intelshield_log_forwarding":$wazuh_block,"active_response_safe_mode":$wazuh_ar},"resources":{"memory_mb":$mem,"root_free_mb":$disk},"vpn":{"port_443_listening":$port443,"panel_port":"$(json_escape "${PANEL_PORT:-}")","panel_public":$panel_public}}
-EOF
-  chmod 600 "${STATE_DB}.tmp" 2>/dev/null || true
-  mv -f "${STATE_DB}.tmp" "$STATE_DB" 2>/dev/null || true
-}
 state_view(){ state_write; showfile "State Database" "$STATE_DB" 36 120; }
 
 
 # ---------- preflight risk engine -------------------------------------------
-preflight_risk_engine(){ local score=100 risk=() warn=() virt sb lock app ufw_active custom_ssh admin_ssh port443 panel_public mitig_off disk mem virt_note; virt=$(systemd-detect-virt 2>/dev/null || echo none); [[ "$virt" == none ]] && virt_note="bare metal or unknown" || virt_note="$virt"; sb=$(mokutil --sb-state 2>/dev/null || echo "unknown / mokutil unavailable"); lock=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable); app=$(svc_state apparmor); ufw status 2>/dev/null | grep -q active && ufw_active=yes || ufw_active=no; [[ "${SSH_PORT:-22}" != 22 ]] && custom_ssh=yes || custom_ssh=no; [[ -n "${SSH_CONNECTION:-}" ]] && admin_ssh=yes || admin_ssh=no; ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq '(:|\])443$' && port443=yes || port443=no; panel_public=no; [[ -n "${PANEL_PORT:-}" ]] && ss -tln 2>/dev/null | grep -E "(0\.0\.0\.0|\[::\]|\*)[:.]${PANEL_PORT}\b" >/dev/null && panel_public=yes; grep -qw mitigations=off /proc/cmdline && mitig_off=yes || mitig_off=no; disk=$(df -Pm / | awk 'NR==2{print $4}' 2>/dev/null || echo 0); mem=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0); [[ "$ufw_active" == no ]] && { risk+=("UFW firewall is not active"); score=$((score-15)); }; [[ "$admin_ssh" == no ]] && warn+=("Admin SSH session not detected; source detection less reliable"); [[ "$port443" == no ]] && warn+=("No listener on port 443; verify x-ui/Xray inbound"); [[ "$panel_public" == yes ]] && { risk+=("x-ui/3x-ui panel appears publicly bound on port ${PANEL_PORT}"); score=$((score-20)); }; [[ "$mitig_off" == yes ]] && { risk+=("CPU mitigations disabled with mitigations=off"); score=$((score-25)); }; [[ "$app" != active ]] && { warn+=("AppArmor is not active"); score=$((score-5)); }; [[ "$lock" == unavailable ]] && warn+=("Kernel lockdown unavailable/disabled"); [[ "$sb" != *enabled* && "$sb" != *Enabled* ]] && warn+=("Secure Boot not enabled or not verifiable"); (( disk < 2048 )) && { risk+=("Root filesystem has less than 2GB free (${disk} MB)"); score=$((score-15)); }; (( mem < 1500 )) && warn+=("RAM below 1.5GB; keep heavy components lightweight"); (( score < 0 )) && score=0; { echo "IntelShield Preflight Risk Report - $(date -Is)"; echo "Security readiness score: $score/100"; echo; echo "Virtualization/container: $virt_note"; echo "Secure Boot: $sb"; echo "Kernel lockdown: $lock"; echo "AppArmor: $app"; echo "UFW active: $ufw_active"; echo "SSH port: ${SSH_PORT:-?} (custom: $custom_ssh)"; echo "Admin over SSH: $admin_ssh"; echo "443 listener: $port443"; echo "Panel public exposure: $panel_public (port: ${PANEL_PORT:-unknown})"; echo "CPU mitigations disabled: $mitig_off"; echo "Root free MB: $disk"; echo "RAM MB: $mem"; echo; echo "High-risk findings:"; printf ' - %s\n' "${risk[@]:-None}"; echo; echo "Warnings:"; printf ' - %s\n' "${warn[@]:-None}"; } >"$RISK_REPORT"; cat >"$RISK_JSON" <<EOF
-{"score":$score,"virt":"$(json_escape "$virt_note")","ufw_active":"$ufw_active","admin_ssh":"$admin_ssh","port443":"$port443","panel_public":"$panel_public","mitigations_off":"$mitig_off","root_free_mb":$disk,"memory_mb":$mem,"updated_at":"$(date -Is)"}
+preflight_risk_engine(){ local score=100 risk=() warn=() virt sb lock app ufw_active custom_ssh admin_ssh port443 mitig_off disk mem virt_note; virt=$(systemd-detect-virt 2>/dev/null || echo none); [[ "$virt" == none ]] && virt_note="bare metal or unknown" || virt_note="$virt"; sb=$(mokutil --sb-state 2>/dev/null || echo "unknown / mokutil unavailable"); lock=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable); app=$(svc_state apparmor); ufw status 2>/dev/null | grep -q active && ufw_active=yes || ufw_active=no; [[ "${SSH_PORT:-22}" != 22 ]] && custom_ssh=yes || custom_ssh=no; [[ -n "${SSH_CONNECTION:-}" ]] && admin_ssh=yes || admin_ssh=no; ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq '(:|\])443$' && port443=yes || port443=no;  grep -qw mitigations=off /proc/cmdline && mitig_off=yes || mitig_off=no; disk=$(df -Pm / | awk 'NR==2{print $4}' 2>/dev/null || echo 0); mem=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0); [[ "$ufw_active" == no ]] && { risk+=("UFW firewall is not active"); score=$((score-15)); }; [[ "$admin_ssh" == no ]] && warn+=("Admin SSH session not detected; source detection less reliable"); [[ "$port443" == no ]] && warn+=("No listener on port 443; verify x-ui/Xray inbound");[[ "$mitig_off" == yes ]] && { risk+=("CPU mitigations disabled with mitigations=off"); score=$((score-25)); }; [[ "$app" != active ]] && { warn+=("AppArmor is not active"); score=$((score-5)); }; [[ "$lock" == unavailable ]] && warn+=("Kernel lockdown unavailable/disabled"); [[ "$sb" != *enabled* && "$sb" != *Enabled* ]] && warn+=("Secure Boot not enabled or not verifiable"); (( disk < 2048 )) && { risk+=("Root filesystem has less than 2GB free (${disk} MB)"); score=$((score-15)); }; (( mem < 1500 )) && warn+=("RAM below 1.5GB; keep heavy components lightweight"); (( score < 0 )) && score=0; { echo "IntelShield Preflight Risk Report - $(date -Is)"; echo "Security readiness score: $score/100"; echo; echo "Virtualization/container: $virt_note"; echo "Secure Boot: $sb"; echo "Kernel lockdown: $lock"; echo "AppArmor: $app"; echo "UFW active: $ufw_active"; echo "SSH port: ${SSH_PORT:-?} (custom: $custom_ssh)"; echo "Admin over SSH: $admin_ssh"; echo "443 listener: $port443";  echo "CPU mitigations disabled: $mitig_off"; echo "Root free MB: $disk"; echo "RAM MB: $mem"; echo; echo "High-risk findings:"; printf ' - %s\n' "${risk[@]:-None}"; echo; echo "Warnings:"; printf ' - %s\n' "${warn[@]:-None}"; } >"$RISK_REPORT"; cat >"$RISK_JSON" <<EOF
+{"score":$score,"virt":"$(json_escape "$virt_note")","ufw_active":"$ufw_active","admin_ssh":"$admin_ssh","port443":"$port443","mitigations_off":"$mitig_off","root_free_mb":$disk,"memory_mb":$mem,"updated_at":"$(date -Is)"}
 EOF
 state_write; { [[ -t 1 ]] && showfile "Preflight Risk Engine" "$RISK_REPORT" 36 120 || true; }; }
 
@@ -1089,7 +1145,7 @@ backup_menu(){
       B) RESULT=(); COUNTER=0; TOTAL=1; run_module backup "Config snapshot" m_backup_system; summary ;;
       R) m_restore_interface ;;
       I) inspect_snapshot ;;
-      S) local self; self="$(install_self)"
+      S) local self; self="$(install_self)" || self="$0"
          printf '0 3 * * 0 root %s --backup >/dev/null 2>&1\n' "$self" >"$CRON_FILE" && chmod 644 "$CRON_FILE"
          msg "Cron Added" "Weekly task scheduled for Sunday at 03:00 execution." ;;
       X) rm -f "$CRON_FILE"; msg "Cron Removed" "Automated pipeline destroyed." ;;
@@ -1106,9 +1162,9 @@ auto_startup_backup(){ local today; today="$(date +%F)"; [[ "$(cat "$STARTUP_BAC
 # ---------- system hardening core modules -----------------------------------
 m_baseline(){
   infobox "Base Synchronization" "Updating repositories, time sync, and core dependencies..."
-  run apt-get update
-  run apt-get -y upgrade
-  run apt-get install -y jq curl ca-certificates gnupg lsb-release software-properties-common \
+  apt_do update
+  apt_do -y upgrade
+  apt_do install -y jq curl ca-certificates gnupg lsb-release software-properties-common \
       chrony unattended-upgrades nftables lsof tcpdump conntrack debsums needrestart apt-listchanges ethtool
   systemctl enable --now chrony >>"$LOG" 2>&1 || systemctl enable --now chronyd >>"$LOG" 2>&1 || true
   cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -1126,16 +1182,22 @@ EOF
 }
 
 
-m_kernel_network(){ modprobe tcp_bbr 2>>"$LOG" || true; echo tcp_bbr >/etc/modules-load.d/intelshield-bbr.conf 2>/dev/null || true; cat >"$SYSCTL_NET" <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+m_kernel_network(){
+  # M2-14 fix: verify tcp_bbr is actually available before writing the sysctl
+  local _bbr_ok=0
+  if modprobe tcp_bbr 2>>"$LOG" && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    _bbr_ok=1
+    echo tcp_bbr >/etc/modules-load.d/intelshield-bbr.conf 2>/dev/null || true
+  else
+    log "WARN: tcp_bbr unavailable — keeping default congestion control"
+  fi
+  { if (( _bbr_ok )); then printf '%s\n' "net.core.default_qdisc = fq" "net.ipv4.tcp_congestion_control = bbr"; fi
+cat <<'SYSCTL'
 net.ipv4.tcp_mtu_probing = 1
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
-# rp_filter=2 (loose) keeps anti-spoof protection but, unlike strict(1), does not
-# drop legitimate asymmetric/policy-routed return traffic on multi-homed relays.
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 net.ipv4.tcp_syncookies = 1
@@ -1159,8 +1221,9 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 fs.file-max = 2097152
-EOF
-run sysctl --system; state_write; }
+SYSCTL
+  } >"$SYSCTL_NET"
+  run sysctl --system; state_write; }
 m_kernel_security(){ cat >"$SYSCTL_SEC" <<'EOF'
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
@@ -1178,12 +1241,17 @@ run sysctl --system; state_write; }
 
 
 m_ufw(){
-  run apt-get install -y ufw
+  apt_do install -y ufw
   local port
   port=$(input "Firewall Setup" "Define target processing inbound authentication port rules:\n- SSH traffic targeting validation\n- 443 TCP/UDP standard tunneling allocations\n\nVerify operational SSH target interface port:" "$SSH_PORT") || return 3
   [[ -z "$port" ]] && port="$SSH_PORT"
   # validate BEFORE 'ufw --force enable' — a typo'd port here = remote lockout
   valid_port "$port" || { msg "Firewall Setup" "'$port' is not a valid port. Aborting before enabling UFW to avoid an SSH lockout."; return 1; }
+  [[ "$port" == *:* ]] && { msg "Firewall Setup" "Port ranges are not valid for SSH rules."; return 1; }
+  local live_port; live_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  if [[ -n "$live_port" && "$port" != "$live_port" ]]; then
+    yesno_danger "Port mismatch" "sshd is listening on $live_port, but you entered $port.\n\nEnabling default-deny will BLOCK your current session.\n\nProceed anyway?" || return 1
+  fi
   run ufw default deny incoming
   run ufw default allow outgoing
   run ufw limit "${port}"/tcp
@@ -1191,6 +1259,13 @@ m_ufw(){
   run ufw allow 443/tcp
   run ufw allow 443/udp
   run ufw --force enable
+  ufw_install_resync_hook
+  # Verify SSH rule survived enable
+  if ! ufw status 2>/dev/null | grep -qE "(^| )${port}/tcp .*ALLOW"; then
+    run ufw disable
+    msg "Firewall" "SSH rule missing after enable — UFW disabled to prevent lockout."
+    return 1
+  fi
   msg "Firewall Initialized" "UFW rules processing cleanly. Port inbound drops enabled across all non-explicit vectors."
   ufw status 2>/dev/null | grep -q "Status: active"
 }
@@ -1228,12 +1303,42 @@ MACs hmac-sha256-etm@openssh.com,hmac-sha512-etm@openssh.com,umac-128-etm@openss
 EOF
   [[ "$disable_pw" == "yes" ]] && echo "PasswordAuthentication no" >>"$dropin"
   if sshd -t 2>>"$LOG"; then
-    # 'limit' adds kernel-level brute-force damping that survives CrowdSec being down
-    [[ "$port" != "$SSH_PORT" ]] && { run ufw limit "${port}"/tcp; run ufw allow "${port}"/tcp; }
-    run systemctl reload ssh || run systemctl reload sshd
+    # M2-10 fix: on port change, remove old UFW rule and re-sync nftables
+    if [[ "$port" != "$SSH_PORT" ]]; then
+      run ufw limit "${port}"/tcp; run ufw allow "${port}"/tcp
+      # Remove the old port's UFW rules to prevent attack surface creep
+      run ufw delete limit "${SSH_PORT}"/tcp 2>/dev/null || true
+      run ufw delete allow "${SSH_PORT}"/tcp 2>/dev/null || true
+      # Re-render nftables IPS/pipeline tables with the new SSH port
+      nft_sync 2>/dev/null || true
+    fi
+    # H2-8 fix: handle SSH socket-activation on Ubuntu 22.10+/24.04
+    # On socket-activated hosts, ssh.socket owns the listening port, not sshd_config.
+    local socket_dropin="/etc/systemd/system/ssh.socket.d/99-intelshield-port.conf"
+    if systemctl cat ssh.socket >/dev/null 2>&1; then
+      # Socket-activated: write a ssh.socket drop-in with the new ListenStream
+      mkdir -p /etc/systemd/system/ssh.socket.d
+      cat >"$socket_dropin" <<SOCKEOF
+[Socket]
+ListenStream=
+ListenStream=$port
+SOCKEOF
+      run systemctl daemon-reload
+      run systemctl restart ssh.socket
+      log "m_ssh: socket-activation detected — wrote $socket_dropin (ListenStream=$port)"
+    else
+      # Traditional: reload sshd service
+      run systemctl reload ssh || run systemctl reload sshd
+    fi
+    # Verify the EFFECTIVE listener with ss (not sshd -T, which only reads config)
     local eff_pw eff_port warn=""
     eff_pw="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')"
-    eff_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    # Use ss to check what port is actually listening (covers both socket and service modes)
+    if ss -tlnp "sport = :$port" 2>/dev/null | grep -q ":${port}"; then
+      eff_port="$port"
+    else
+      eff_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    fi
     [[ "$disable_pw" == "yes" && "$eff_pw" != "no" ]] && warn+="\n\n⚠ PasswordAuthentication is still '$eff_pw' — a directive earlier in /etc/ssh/sshd_config overrides the drop-in. Move or remove it."
     [[ -n "$eff_port" && "$eff_port" != "$port" ]] && warn+="\n\n⚠ Effective SSH port is '$eff_port', not '$port' — check for a conflicting Port line."
     msg "SSH Hardened" "Configuration written to $dropin.\nEffective port: ${eff_port:-$port}   Password auth: ${eff_pw:-unknown}${warn}"
@@ -1252,14 +1357,14 @@ m_crowdsec(){
     # (not `curl | sh`) and always tracks CrowdSec's current, correct packagecloud
     # repo layout. (v4.0 tried to hand-build a pinned packagecloud repo line, but a
     # wrong path there breaks `apt-get update` system-wide, so v5.0 reverts to this.)
-    run apt-get install -y curl gnupg ca-certificates
+    apt_do install -y curl gnupg ca-certificates
     local inst="$IS_TMP/crowdsec-repo.sh"
     if curl -fsSL --proto '=https' --tlsv1.2 https://install.crowdsec.net -o "$inst" 2>>"$LOG" && [[ -s "$inst" ]]; then
       run sh "$inst"
     else
       log "crowdsec repo installer fetch failed; falling back to whatever the distro provides"
     fi
-    run apt-get install -y crowdsec
+    apt_do install -y crowdsec
   fi
   have_cs || { msg "Dependency Error" "Engine deployment trace exited unexpectedly. Check $LOG."; return 1; }
   run cscli hub update || true   # fresh hub index before resolving collections
@@ -1284,7 +1389,7 @@ m_allowlist(){
 m_bouncer(){
   need_cs || return 1
   infobox "Enforcement Architecture" "Injecting CrowdSec nftables kernel-level filtering bouncers..."
-  run apt-get install -y crowdsec-firewall-bouncer-nftables
+  apt_do install -y crowdsec-firewall-bouncer-nftables
   run systemctl enable --now crowdsec-firewall-bouncer
   msg "Bouncer Operational" "Netfilter tracking layer linked directly to CrowdSec database updates. Malicious scans are dropped natively at the kernel level."
   systemctl is-active --quiet crowdsec-firewall-bouncer
@@ -1298,22 +1403,22 @@ suricata_fix_libhtp_conflict(){
   log "suricata: attempting libhtp1 -> libhtp2 conflict remediation"
   if apt-cache show libhtp2 >/dev/null 2>&1; then
     # naming libhtp2 explicitly lets apt plan the libhtp1 -> libhtp2 swap itself
-    run apt-get install -y suricata suricata-update libhtp2 && return 0
+    apt_do install -y suricata suricata-update libhtp2 && return 0
   fi
   # last resort: drop the stale bindings and retry once
   local p
-  for p in libhtp1 libhtp0; do dpkg -s "$p" >/dev/null 2>&1 && run apt-get purge -y "$p"; done
-  run apt-get -y -f install || true
-  run apt-get install -y suricata suricata-update
+  for p in libhtp1 libhtp0; do dpkg -s "$p" >/dev/null 2>&1 && apt_do purge -y "$p"; done
+  apt_do -y -f install || true
+  apt_do install -y suricata suricata-update
 }
 
 m_suricata(){
   infobox "IDS Framework" "Provisioning Suricata 8: OISF stable engine, signatures and configuration..."
   # add-apt-repository lives in software-properties-common; ensure it before using it
-  have add-apt-repository || run apt-get install -y software-properties-common
+  have add-apt-repository || apt_do install -y software-properties-common
   # The OISF PPA ships Suricata 8 for BOTH jammy (22.04) and noble (24.04).
   run add-apt-repository -y ppa:oisf/suricata-stable || log "add-apt-repository failed — continuing with the Ubuntu archive"
-  run apt-get update
+  apt_do update
   # Trust the PPA only if it actually serves a candidate for this codename (noble
   # had a gap until Aug 2024; a future series could regress the same way). The
   # Ubuntu archive still ships Suricata on noble, so this is informational —
@@ -1329,16 +1434,16 @@ m_suricata(){
   #   - libhtp2 may still be a transition package; handle gracefully
   # suricata-update is its own package — always name it explicitly (on noble it is
   # NOT pulled in automatically in every path).
-  if ! run apt-get install -y suricata suricata-update jq; then
+  if ! apt_do install -y suricata suricata-update jq; then
     suricata_fix_libhtp_conflict || { msg "Signature Error" "Suricata failed to install (dependency conflict could not be auto-resolved) — see $LOG."; return 1; }
-    run apt-get install -y jq || true
+    apt_do install -y jq || true
   fi
   # ROOT-CAUSE FIX for "engine/keyword mismatch": if a distro Suricata (6.x/7.x)
   # was already present, `install` won't move it to the PPA's 8.x — force the
   # upgrade so the engine is new enough for the current ET/open ruleset keywords
   # and supports Suricata 8's new firewall mode, transactional rules, and 107+ new
   # keywords (entropy, luaxform, absent, etc.).
-  run apt-get install -y --only-upgrade suricata || suricata_fix_libhtp_conflict || true
+  apt_do install -y --only-upgrade suricata || suricata_fix_libhtp_conflict || true
   command -v suricata >/dev/null 2>&1 || { msg "Signature Error" "Suricata failed to install — see $LOG."; return 1; }
   log "Suricata engine: $(suricata -V 2>/dev/null | tr -d '\n')"
   # /etc/default/suricata is plain KEY=VALUE (not yaml) — edited directly.
@@ -1420,150 +1525,6 @@ EOF
 }
 
 
-# ---------- x-ui/Xray systemd sandbox (REMOVED in v9.5) ---------------------
-# Global immutability engine replaces application-level sandboxing.
-
-# Write the sandbox drop-in for ONE unit. $1=unit  $2=caps  $3=mdwe(on|off)
-sandbox_write_dropin(){
-  local unit="$1" caps="$2" mdwe="$3" d="/etc/systemd/system/${1}.d" mdwe_line="# MemoryDenyWriteExecute disabled (off) for x-ui/Xray self-update compatibility"
-  [[ "$mdwe" == on ]] && mdwe_line="MemoryDenyWriteExecute=true"
-  mkdir -p "$d"
-  cat >"$d/${SANDBOX_DROPIN_NAME}" <<EOF
-[Service]
-# IntelShield systemd sandbox for x-ui/Xray — blast-radius containment that still
-# lets the panel READ every file it needs, WRITE its own db/logs/config/bin, and
-# make the SYSTEM CALLS a network service requires (@system-service allowlist).
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-RestrictSUIDSGID=true
-RestrictRealtime=true
-RestrictNamespaces=true
-LockPersonality=true
-${mdwe_line}
-RemoveIPC=true
-UMask=0077
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-CapabilityBoundingSet=${caps}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-# syscall policy: allow the standard system-service set (covers Go runtime, epoll,
-# sockets, threads, file IO) and turn anything else into EPERM rather than a kill —
-# so a stray syscall can't crash the panel. Rollback below catches any real break.
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-# ProtectSystem=strict only makes the FS READ-ONLY (reads still work everywhere);
-# these are the paths x-ui/Xray must be able to WRITE (db, logs, config, bin, geo).
-# '-' prefix = ignore a path that does not exist (a missing path used to abort the
-# whole unit at namespace-setup). /etc/x-ui included: 3x-ui keeps x-ui.db there.
-ReadWritePaths=-/usr/local/x-ui -/opt/3x-ui -/etc/x-ui -/var/log/x-ui -/var/log/xray -/usr/local/etc/xray -/etc/xray -/var/lib/x-ui
-EOF
-}
-
-# Apply the sandbox to every present x-ui/xray unit, verifying each and rolling
-# back per-unit on failure. Reused by profiles, guided run and the sandbox menu.
-# rollback hook for restart_or_rollback: drop the failing unit's sandbox drop-in
-SANDBOX_RB_UNIT=""
-sandbox_rollback_unit(){ rm -f "/etc/systemd/system/${SANDBOX_RB_UNIT}.d/${SANDBOX_DROPIN_NAME}"; run systemctl daemon-reload; }
-sandbox_apply(){
-  local units caps mdwe u ok=() bad=()
-  units="$(sandbox_target_units)"
-  [[ -z "$units" ]] && { msg Sandbox "No x-ui/xray service found on this host."; return 3; }
-  caps="CAP_NET_BIND_SERVICE"
-  # 3x-ui IP-limit/fail2ban and Xray tproxy need extra net caps — offer them so the
-  # sandbox never silently breaks panel features (default assumes yes when headless).
-  if yesno "Sandbox Capabilities" "Grant extra network capabilities?\n\nRecommended YES if this node uses:\n • 3x-ui IP-limit / fail2ban\n • Xray tproxy / transparent-proxy inbounds\n\nYes = CAP_NET_BIND_SERVICE + CAP_NET_ADMIN + CAP_NET_RAW\nNo  = bind-only (tighter, but disables those features)"; then
-    caps="CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW"
-  fi
-  mdwe="$(sandbox_mdwe_get)"
-  for u in $units; do sandbox_write_dropin "$u" "$caps" "$mdwe"; done
-  run systemctl daemon-reload
-  # v8.0: per-unit atomic gate — if a unit fails WITH the sandbox, the drop-in
-  # is removed and the unit restarted unconfined (restart_or_rollback contract).
-  for u in $units; do
-    SANDBOX_RB_UNIT="$u"
-    if restart_or_rollback "$u" sandbox_rollback_unit; then ok+=("$u"); else bad+=("$u"); fi
-  done
-  state_write
-  if [[ ${#bad[@]} -eq 0 ]]; then
-    msg Sandbox "Sandbox APPLIED to: ${ok[*]}\n\nCapabilities: $caps\nMemoryDenyWriteExecute: $mdwe\nSyscall policy: @system-service (EPERM on others)\n\nTip: turn the sandbox OFF from this menu before a MANUAL panel update, then back on."
-    return 0
-  fi
-  msg Sandbox "Some units failed WITH the sandbox and were rolled back automatically:\n  failed : ${bad[*]}\n  ok     : ${ok[*]:-none}\n\nTry toggling MemoryDenyWriteExecute OFF (Sandbox menu) and re-applying. See $LOG."
-  return 1
-}
-# Registry / profile entry point.
-m_sandbox(){ sandbox_apply; }
-
-# Remove the sandbox from x-ui/Xray and restart them UNCONFINED. This is what you
-# run before manually updating the panel; nothing is purged, just un-sandboxed.
-sandbox_off(){
-  local u touched=0 restarted=()
-  for u in x-ui xray; do
-    local f="/etc/systemd/system/${u}.service.d/${SANDBOX_DROPIN_NAME}"
-    [[ -f "$f" ]] && { rm -f "$f"; rmdir "/etc/systemd/system/${u}.service.d" 2>/dev/null || true; touched=1; }
-  done
-  run systemctl daemon-reload
-  for u in x-ui xray; do svc_exists "$u.service" && systemctl is-active --quiet "$u" && { run systemctl restart "$u"; restarted+=("$u"); }; done
-  state_write
-  return 0
-}
-
-sandbox_toggle_mdwe(){
-  local cur; cur="$(sandbox_mdwe_get)"
-  if [[ "$cur" == on ]]; then echo off >"$SANDBOX_MDWE_FILE"; else echo on >"$SANDBOX_MDWE_FILE"; fi
-  msg "MDWE Hardening" "MemoryDenyWriteExecute is now: $(sandbox_mdwe_get)\n\nON  = harder (blocks writable+executable memory) — extra protection, but can\n      break x-ui/Xray self-update or some transports.\nOFF = maximum compatibility (recommended default).\n\nRe-apply the sandbox for this to take effect."
-  sandbox_is_applied && yesno "Re-apply Now?" "Re-apply the sandbox with MemoryDenyWriteExecute=$(sandbox_mdwe_get)?" && sandbox_apply
-}
-
-sandbox_status_view(){
-  local u f
-  { echo "x-ui / Xray systemd sandbox status  —  $(date -Is)"
-    echo "MemoryDenyWriteExecute hardening preference: $(sandbox_mdwe_get)"
-    echo "Detected units: $(sandbox_target_units | sed 's/\.service//g' || echo none)"
-    echo
-    for u in x-ui xray; do
-      svc_exists "$u.service" || { echo "== $u ==  (service not installed)"; echo; continue; }
-      f="/etc/systemd/system/${u}.service.d/${SANDBOX_DROPIN_NAME}"
-      echo "== $u =="
-      echo "  service : $(svc_state "$u.service")"
-      [[ -f "$f" ]] && echo "  sandbox : APPLIED" || echo "  sandbox : not applied"
-      echo "  effective systemd confinement:"
-      systemctl show "$u" -p ProtectSystem -p MemoryDenyWriteExecute -p CapabilityBoundingSet \
-                          -p SystemCallFilter -p ReadWritePaths -p RestrictAddressFamilies 2>/dev/null \
-        | sed 's/^/    /'
-      echo
-    done
-    echo "Files/logs the panel can still WRITE (ReadWritePaths):"
-    echo "  /usr/local/x-ui /opt/3x-ui /etc/x-ui /var/log/x-ui /var/log/xray /usr/local/etc/xray /etc/xray /var/lib/x-ui"
-  } >"$IS_TMP/sandbox-status"
-  showfile "Sandbox Status" "$IS_TMP/sandbox-status" 34 118
-}
-
-sandbox_menu(){
-  local c st mdwe units
-  while :; do
-    st="not applied"; sandbox_is_applied && st="APPLIED"
-    mdwe="$(sandbox_mdwe_get)"; units="$(sandbox_target_units | sed 's/\.service//g')"
-    c=$(menu "x-ui / Xray Sandbox Control" "Sandbox: ${st}   |   MDWE hardening: ${mdwe}   |   units: ${units:-none found}" \
-      E "Enable / (re)apply sandbox" \
-      D "Disable sandbox — run BEFORE a manual x-ui panel update" \
-      T "Toggle MemoryDenyWriteExecute hardening (now: ${mdwe})" \
-      V "View sandbox status + effective confinement" \
-      b "Back") || return
-    case "$c" in
-      b) return ;;
-    esac
-  done
-}
 
 
 m_console(){
@@ -1579,39 +1540,17 @@ m_console(){
   return 0
 }
 
-m_panel(){
-  local p="$PANEL_PORT"
-  if [[ -z "$p" ]]; then
-    p=$(input "Interface Shielding" "Input structural port indexing used by active interface dashboards:" "") || return 3
-  fi
-  [[ -z "$p" ]] && return 3
-  local choice
-  choice=$(menu "Interface Access Topology" "Dashboard binding discovered on interface port: $p" \
-    R "Restrict connectivity strictly to isolated network address" \
-    G "Review infrastructural deployment guidelines") || return 3
-  if [[ "$choice" == "R" ]]; then
-     local src
-     src=$(input "Network Scoping" "Input target administrative host vector allowed context accessibility:" "$SSH_CLIENT_IP") || return 3
-     valid_ip "$src" || { msg "Error" "Syntax verification failed."; return 1; }
-     run ufw allow from "$src" to any port "$p" proto tcp
-     run ufw delete allow "${p}"/tcp
-     run ufw delete allow "${p}"
-     msg "Access Scoped" "Inbound firewall definitions reconfigured explicitly."
-  elif [[ "$choice" == "G" ]]; then
-     msg "Architecture Best Practices" "For optimal protection, bind your panel listener locally to 127.0.0.1 and route connections securely through an encrypted overlay network (such as Headscale/WireGuard) or via an authenticated SSH tunnel, completely eliminating public vector exposure."
-  fi
-}
 
 
 # ---------- CPU microcode + platform security audit -------------------------
 cpu_vendor(){ lscpu 2>/dev/null|awk -F: '/Vendor ID/{gsub(/^[ \t]+/,"",$2); print tolower($2); exit}'; }
 cpu_model(){ lscpu 2>/dev/null|awk -F: '/Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}'; }
-m_cpu_microcode(){ local v m pkg report; v=$(cpu_vendor); m=$(cpu_model); [[ "$v" == *intel* ]] && pkg=intel-microcode || { [[ "$v" == *amd* || "$v" == *advanced* ]] && pkg=amd64-microcode || pkg=""; }; [[ -n "$pkg" ]] && { run apt-get update; run apt-get install -y "$pkg"; }; report=/var/log/intelshield/cpu-mitigations.txt; mkdir -p /var/log/intelshield; { echo "CPU: $m"; echo "Vendor: $v"; echo "Microcode package: ${pkg:-none}"; echo; cat /proc/cmdline; echo; for f in /sys/devices/system/cpu/vulnerabilities/*; do [[ -r "$f" ]] && echo "$(basename "$f"): $(cat "$f")"; done; } >"$report"; state_write; grep -qw mitigations=off /proc/cmdline && { msg CPU "CRITICAL: mitigations=off found. Report: $report"; return 1; }; msg CPU "Detected: ${m:-unknown}\nPackage: ${pkg:-none}\nReboot recommended if package installed.\nReport: $report"; }
-m_platform_security(){ run apt-get install -y mokutil tpm2-tools cryptsetup-bin dmsetup || true; local r=/var/log/intelshield/platform-security.txt; mkdir -p /var/log/intelshield; { echo SecureBoot; mokutil --sb-state 2>/dev/null || true; echo; echo Lockdown; cat /sys/kernel/security/lockdown 2>/dev/null || true; echo; echo TPM; tpm2_getcap properties-fixed 2>/dev/null || true; echo; lsblk -f; dmsetup ls --target crypt 2>/dev/null || true; } >"$r"; state_write; }
+m_cpu_microcode(){ local v m pkg report; v=$(cpu_vendor); m=$(cpu_model); [[ "$v" == *intel* ]] && pkg=intel-microcode || { [[ "$v" == *amd* || "$v" == *advanced* ]] && pkg=amd64-microcode || pkg=""; }; [[ -n "$pkg" ]] && { apt_do update; apt_do install -y "$pkg"; }; report=/var/log/intelshield/cpu-mitigations.txt; mkdir -p /var/log/intelshield; { echo "CPU: $m"; echo "Vendor: $v"; echo "Microcode package: ${pkg:-none}"; echo; cat /proc/cmdline; echo; for f in /sys/devices/system/cpu/vulnerabilities/*; do [[ -r "$f" ]] && echo "$(basename "$f"): $(cat "$f")"; done; } >"$report"; state_write; grep -qw mitigations=off /proc/cmdline && { msg CPU "WARNING: mitigations=off found — this is a risk finding, not a module failure.\nReport: $report"; }; msg CPU "Detected: ${m:-unknown}\nPackage: ${pkg:-none}\nReboot recommended if package installed.\nReport: $report"; }
+m_platform_security(){ apt_do install -y mokutil tpm2-tools cryptsetup-bin dmsetup || true; local r=/var/log/intelshield/platform-security.txt; mkdir -p /var/log/intelshield; { echo SecureBoot; mokutil --sb-state 2>/dev/null || true; echo; echo Lockdown; cat /sys/kernel/security/lockdown 2>/dev/null || true; echo; echo TPM; tpm2_getcap properties-fixed 2>/dev/null || true; echo; lsblk -f; dmsetup ls --target crypt 2>/dev/null || true; } >"$r"; state_write; }
 
 
 # ---------- auditd / AIDE / AppArmor / USG / health timer --------------------
-m_auditd(){ run apt-get install -y auditd audispd-plugins; cat >/etc/audit/rules.d/99-intelshield.rules <<'EOF'
+m_auditd(){ apt_do install -y auditd audispd-plugins; cat >/etc/audit/rules.d/99-intelshield.rules <<'EOF'
 -b 8192
 -w /etc/passwd -p wa -k identity
 -w /etc/shadow -p wa -k identity
@@ -1629,10 +1568,10 @@ m_auditd(){ run apt-get install -y auditd audispd-plugins; cat >/etc/audit/rules
 -a always,exit -F arch=b32 -S execve -F euid=0 -k root-commands
 EOF
 run augenrules --load || true; run systemctl enable --now auditd; state_write; }
-m_aide(){ run apt-get install -y aide aide-common; aideinit >>"$LOG" 2>&1 || true; [[ -f /var/lib/aide/aide.db.new ]] && cp -f /var/lib/aide/aide.db.new /var/lib/aide/aide.db; state_write; }
-m_apparmor(){ run apt-get install -y apparmor apparmor-utils; run systemctl enable --now apparmor || true; state_write; }
+m_aide(){ apt_do install -y aide aide-common; aideinit >>"$LOG" 2>&1 || true; [[ -f /var/lib/aide/aide.db.new ]] && cp -f /var/lib/aide/aide.db.new /var/lib/aide/aide.db; state_write; }
+m_apparmor(){ apt_do install -y apparmor apparmor-utils; run systemctl enable --now apparmor || true; state_write; }
 m_usg_audit(){
-  run apt-get install -y ubuntu-advantage-tools || true
+  apt_do install -y ubuntu-advantage-tools || true
   have usg || { msg USG "USG not available. Enable it first: 'pro enable usg'."; return 3; }
   mkdir -p /var/log/intelshield/usg
   # flag names are --html-file / --results-file (the old --report/--results silently failed)
@@ -1701,12 +1640,12 @@ EOF
 # or whitelists everything). Set it dynamically so a custom SSH port is honoured.
 ark_config_set /etc/rkhunter.conf.local PORT_WHITELIST "\"TCP:${SSH_PORT:-22} TCP:80 TCP:443 UDP:443\""
 ark_config_set /etc/rkhunter.conf UPDATE_MIRRORS 1; ark_config_set /etc/rkhunter.conf MIRRORS_MODE 0; ark_config_set /etc/rkhunter.conf WEB_CMD '""'; [[ -f /etc/default/rkhunter ]] && { ark_config_set /etc/default/rkhunter CRON_DAILY_RUN '"false"'; ark_config_set /etc/default/rkhunter CRON_DB_UPDATE '"false"'; ark_config_set /etc/default/rkhunter APT_AUTOGEN '"yes"'; }; fi; [[ "$quiet" == silent ]] || msg "Whitelist Safe Areas" "Safe-area whitelist applied."; }
-m_ark_install(){ ark_init; run apt-get update; run apt-get install -y rkhunter chkrootkit; ark_whitelist_safe_areas silent; rkhunter_present && { run rkhunter --update || true; run rkhunter --propupd || true; }; state_write; }
+m_ark_install(){ ark_init; apt_do update; apt_do install -y rkhunter chkrootkit; ark_whitelist_safe_areas silent; rkhunter_present && { run rkhunter --update || true; run rkhunter --propupd || true; }; state_write; }
 ark_extract_paths(){ local logf="$1" outf="$2"; : >"$outf"; grep -Eo '(/[A-Za-z0-9._@%+=:,/ -]+)' "$logf" 2>/dev/null | sed 's/[[:space:]]*$//' | while read -r x; do [[ -e "$x" ]] && printf '%s\n' "$x"; done | sort -u >>"$outf" || true; }
 ark_scan_rkhunter(){ ark_init; rkhunter_present || return 1; local ts logf paths; ts=$(date +%Y%m%d_%H%M%S); logf="$ARK_LOG_DIR/rkhunter_${ts}.log"; paths="$ARK_DIR/rkhunter_${ts}.paths"; run rkhunter --update || true; rkhunter --check --sk --rwo --append-log --logfile "$logf" >>"$logf" 2>&1 || true; ark_extract_paths "$logf" "$paths"; ln -sfn "$logf" "$ARK_LOG_DIR/rkhunter_latest.log"; ln -sfn "$paths" "$ARK_DIR/rkhunter_latest.paths"; state_write; }
 ark_scan_chkrootkit(){ ark_init; chkrootkit_present || return 1; local ts logf paths opts=(); ts=$(date +%Y%m%d_%H%M%S); logf="$ARK_LOG_DIR/chkrootkit_${ts}.log"; paths="$ARK_DIR/chkrootkit_${ts}.paths"; source "$ARK_CONF" 2>/dev/null || true; [[ -n "${CHKROOTKIT_EXCLUDES:-}" ]] && opts=(-e "$CHKROOTKIT_EXCLUDES"); chkrootkit -q "${opts[@]}" >"$logf" 2>&1 || true; ark_extract_paths "$logf" "$paths"; ln -sfn "$logf" "$ARK_LOG_DIR/chkrootkit_latest.log"; ln -sfn "$paths" "$ARK_DIR/chkrootkit_latest.paths"; state_write; }
 ark_scan_all(){ rkhunter_present && ark_scan_rkhunter || true; chkrootkit_present && ark_scan_chkrootkit || true; msg "Anti Rootkit" "Scans complete. View Detection Monitor for results."; }
-ark_set_schedule(){ local tool="$1" time self; time=$(input "Schedule $tool" "Daily time HH:MM. Default midnight:" "00:00") || return 3; [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { msg Time "Invalid HH:MM"; return 1; }; self=$(install_self); cat >/etc/systemd/system/intelshield-antirootkit-${tool}.service <<EOF
+ark_set_schedule(){ local tool="$1" time self; time=$(input "Schedule $tool" "Daily time HH:MM. Default midnight:" "00:00") || return 3; [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { msg Time "Invalid HH:MM"; return 1; }; self=$(install_self) || self="$0"; cat >/etc/systemd/system/intelshield-antirootkit-${tool}.service <<EOF
 [Unit]
 Description=IntelShield Anti Rootkit ${tool} scan
 Wants=network-online.target
@@ -1734,8 +1673,8 @@ ark_logs_menu(){ local files=() args=() f c; mapfile -t files < <(find "$ARK_LOG
 ark_safe_path(){ local x="${1:-}"; [[ -n "$x" && -e "$x" ]] || return 1; case "$x" in /proc/*|/sys/*|/dev/*|/run/*|/boot/*|/lib/*|/lib64/*|/bin/*|/sbin/*|/usr/*|/etc/*|/var/lib/*|/opt/3x-ui/*) return 2;; esac; return 0; }
 ark_quarantine_detected(){ local paths=() args=() pf p c qf; for pf in "$ARK_DIR"/*.paths; do [[ -f "$pf" ]] || continue; while read -r p; do [[ -e "$p" ]] && paths+=("$p"); done <"$pf"; done; [[ ${#paths[@]} -gt 0 ]] && mapfile -t paths < <(printf '%s\n' "${paths[@]}"|sort -u); [[ ${#paths[@]} -gt 0 ]] || { msg Quarantine "No path candidates found."; return 3; }; for p in "${paths[@]}"; do args+=("$p" "$p"); done; c=$(menu Quarantine "Manual only. Protected OS paths are blocked." "${args[@]}") || return; ark_safe_path "$c" || { msg Protected "Refusing protected path: $c"; return 1; }; yesno Confirm "Move to quarantine?\n$c" || return; qf="$ARK_QUAR/$(date +%s)_$$_$(basename "$c")"; local fmeta; fmeta="$(stat -c '%a:%u:%g' "$c" 2>/dev/null || echo '600:0:0')"; mv -f "$c" "$qf" >>"$LOG" 2>&1 && { chmod 000 "$qf"; printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u '+%F %T')" "$qf" "$c" "manual anti-rootkit quarantine" "$fmeta" >>"$ARK_MANIFEST"; msg Quarantine "Moved to $qf"; } || msg Quarantine "Failed."; }
 ark_restore_quarantine(){ [[ -s "$ARK_MANIFEST" ]] || { msg Restore "No quarantined items."; return 3; }; local args=() ts qf orig reason fmeta pick meta fmode fuid fgid; while IFS=$'\t' read -r ts qf orig reason fmeta; do [[ -e "$qf" ]] && args+=("$qf" "$(basename "$orig") -> $orig"); done <"$ARK_MANIFEST"; [[ ${#args[@]} -gt 0 ]] || return 3; pick=$(menu "Restore False Positive" "Select item:" "${args[@]}") || return; meta=$(awk -F'\t' -v q="$pick" '$2==q{print; exit}' "$ARK_MANIFEST"); IFS=$'\t' read -r ts qf orig reason fmeta <<<"$meta"; yesno Restore "Restore to $orig?" || return; mkdir -p "$(dirname "$orig")"; IFS=: read -r fmode fuid fgid <<<"${fmeta:-600:0:0}"; if mv -f "$qf" "$orig" >>"$LOG" 2>&1; then chmod "${fmode:-600}" "$orig" 2>/dev/null || true; chown "${fuid:-0}:${fgid:-0}" "$orig" 2>/dev/null || true; awk -F'\t' -v q="$pick" '$2!=q' "$ARK_MANIFEST" >"$ARK_MANIFEST.tmp" 2>/dev/null && mv -f "$ARK_MANIFEST.tmp" "$ARK_MANIFEST"; msg Restore "Restored with original mode/owner ($fmode $fuid:$fgid)."; else msg Restore "Failed."; fi; }
-rkhunter_menu(){ local c; while :; do c=$(menu "rkhunter Management" "Status: $(rkhunter_present&&echo installed||echo missing)" I "Install/update" U "Update DB + propupd" S "Run scan" W "Whitelist Safe Areas" L "View logs" D "Detection monitor" Q "Quarantine detected item" R "Restore false positive" T "Set schedule" X "Disable schedule" b Back) || break; case "$c" in I) run apt-get update; run apt-get install -y rkhunter; ark_whitelist_safe_areas silent; run rkhunter --update || true; run rkhunter --propupd || true; state_write;; U) run rkhunter --update || true; run rkhunter --propupd || true; msg rkhunter Updated;; S) ark_scan_rkhunter; msg rkhunter "Scan complete.";; W) ark_whitelist_safe_areas;; L) ark_logs_menu;; D) ark_detections_view;; Q) ark_quarantine_detected;; R) ark_restore_quarantine;; T) ark_set_schedule rkhunter;; X) ark_disable_schedule rkhunter;; b) break;; esac; done; }
-chkrootkit_menu(){ local c; while :; do c=$(menu "chkrootkit Management" "Status: $(chkrootkit_present&&echo installed||echo missing)" I "Install/update" S "Run scan" W "Whitelist Safe Areas" L "View logs" D "Detection monitor" Q "Quarantine detected item" R "Restore false positive" T "Set schedule" X "Disable schedule" b Back) || break; case "$c" in I) run apt-get update; run apt-get install -y chkrootkit; ark_whitelist_safe_areas silent; state_write;; S) ark_scan_chkrootkit; msg chkrootkit "Scan complete.";; W) ark_whitelist_safe_areas;; L) ark_logs_menu;; D) ark_detections_view;; Q) ark_quarantine_detected;; R) ark_restore_quarantine;; T) ark_set_schedule chkrootkit;; X) ark_disable_schedule chkrootkit;; b) break;; esac; done; }
+rkhunter_menu(){ local c; while :; do c=$(menu "rkhunter Management" "Status: $(rkhunter_present&&echo installed||echo missing)" I "Install/update" U "Update DB + propupd" S "Run scan" W "Whitelist Safe Areas" L "View logs" D "Detection monitor" Q "Quarantine detected item" R "Restore false positive" T "Set schedule" X "Disable schedule" b Back) || break; case "$c" in I) apt_do update; apt_do install -y rkhunter; ark_whitelist_safe_areas silent; run rkhunter --update || true; run rkhunter --propupd || true; state_write;; U) run rkhunter --update || true; run rkhunter --propupd || true; msg rkhunter Updated;; S) ark_scan_rkhunter; msg rkhunter "Scan complete.";; W) ark_whitelist_safe_areas;; L) ark_logs_menu;; D) ark_detections_view;; Q) ark_quarantine_detected;; R) ark_restore_quarantine;; T) ark_set_schedule rkhunter;; X) ark_disable_schedule rkhunter;; b) break;; esac; done; }
+chkrootkit_menu(){ local c; while :; do c=$(menu "chkrootkit Management" "Status: $(chkrootkit_present&&echo installed||echo missing)" I "Install/update" S "Run scan" W "Whitelist Safe Areas" L "View logs" D "Detection monitor" Q "Quarantine detected item" R "Restore false positive" T "Set schedule" X "Disable schedule" b Back) || break; case "$c" in I) apt_do update; apt_do install -y chkrootkit; ark_whitelist_safe_areas silent; state_write;; S) ark_scan_chkrootkit; msg chkrootkit "Scan complete.";; W) ark_whitelist_safe_areas;; L) ark_logs_menu;; D) ark_detections_view;; Q) ark_quarantine_detected;; R) ark_restore_quarantine;; T) ark_set_schedule chkrootkit;; X) ark_disable_schedule chkrootkit;; b) break;; esac; done; }
 anti_rootkit_menu(){ ark_init; local c; while :; do c=$(menu "Anti Rootkit Defense" "rkhunter + chkrootkit. Default: report-only. Quarantine is manual and protected." A "Install both" R "Manage rkhunter separately" C "Manage chkrootkit separately" S "Run both scans" W "Whitelist Safe Areas" M "Intelligent detection monitor" Q "Quarantine detected item" F "Restore false positive" T "Set both schedules" X "Disable both schedules" b Back) || break; case "$c" in A) m_ark_install;; R) rkhunter_menu;; C) chkrootkit_menu;; S) ark_scan_all;; W) ark_whitelist_safe_areas;; M) ark_detections_view;; Q) ark_quarantine_detected;; F) ark_restore_quarantine;; T) ark_set_schedule rkhunter; ark_set_schedule chkrootkit;; X) ark_disable_schedule rkhunter; ark_disable_schedule chkrootkit;; b) break;; esac; done; }
 
 
@@ -1796,7 +1735,7 @@ suricata_write_base_dropins(){
 vars:
   address-groups:
     HOME_NET: "$home_net"
-    EXTERNAL_NET: "!\\$HOME_NET"
+    EXTERNAL_NET: "!\$HOME_NET"
 EOF
   fi
   if [[ -n "$NIC" ]]; then
@@ -1863,10 +1802,11 @@ suricata_write_disabled_sids(){
 }
 
 suricata_sanitize_rules(){
-  local rules="/var/lib/suricata/rules/suricata.rules" err new_sids prior merged n iter=0 max=10 start_cnt
+  local rules="/var/lib/suricata/rules/suricata.rules" err new_sids prior merged n iter=0 max=10 start_cnt deadline
   [[ -f "$rules" ]] || return 1
   start_cnt="$(suricata_disabled_sids | grep -c . || true)"
-  while (( iter++ < max )); do
+  deadline=$(( SECONDS + 600 ))  # 10-minute wall-clock limit
+  while (( iter++ < max )) && (( SECONDS < deadline )); do
     err="$IS_TMP/suri-T"
     if suricata -T -c "$SURICATA_YAML" >"$err" 2>&1; then
       cat "$err" >>"$LOG"
@@ -1895,6 +1835,7 @@ suricata_sanitize_rules(){
     # re-merge so the disabled SIDs are cleanly omitted; our -T stays the arbiter
     run suricata-update --no-test --no-reload || { log "suricata_sanitize_rules: suricata-update re-merge failed"; return 1; }
   done
+  (( SECONDS >= deadline )) && log "suricata_sanitize_rules: aborted on 10-minute timeout"
   log "suricata_sanitize_rules: still failing after $max repair passes"
   return 1
 }
@@ -1902,13 +1843,24 @@ suricata_sanitize_rules(){
 suricata_repair(){ m_suricata; }
 suricata_tune_lowram(){
   have suricata || m_suricata
+  # M2-12 fix: set explicit memcaps that dominate Suricata RSS on low-RAM VPS
   if suricata_apply_dropin 30-tuning.yaml <<'EOF'
 # IntelShield override — low-RAM VPS tuning
 max-pending-packets: 1024
 detect:
   profile: low
+# Memory caps tuned for ≤1 GB RAM VPS (defaults total ~448 MB, these total ~128 MB)
+flow:
+  memcap: 32mb
+stream:
+  memcap: 32mb
+  reassembly:
+    memcap: 64mb
+    depth: 1mb
+defrag:
+  memcap: 32mb
 EOF
-  then state_write; msg Suricata "Low-RAM VPS tuning applied (drop-in: ${SURICATA_INCLUDE_DIR}/30-tuning.yaml)."
+  then state_write; msg Suricata "Low-RAM VPS tuning applied (drop-in: ${SURICATA_INCLUDE_DIR}/30-tuning.yaml).\nMemcaps: flow=32m stream=32m reassembly=64m defrag=32m"
   else msg Suricata "Tuning failed validation — previous config restored. See $LOG."; return 1; fi
 }
 suricata_tune_highthroughput(){
@@ -1974,6 +1926,12 @@ suricata_rules_rollback(){   # restore the pre-update ruleset (restart_or_rollba
 suricata_update_rules(){
   have suricata || { msg Suricata "Install Suricata first."; return 1; }
   have suricata-update || { msg Suricata "suricata-update not installed."; return 1; }
+  # H2-16 fix: serialize rule updates to prevent torn rulesets from concurrent TUI + cron
+  { suri_rules_lock || { log "suricata_update_rules: skipped — another rule update is in progress"; msg Suricata "Rule update already in progress — skipping."; return 1; }
+  _suricata_update_rules_inner "$@"
+  } {SURI_RULES_FD}<"$SURI_RULES_LOCK"
+}
+_suricata_update_rules_inner(){
   SURI_RULES_SNAP="$IS_TMP/suricata.rules.snapshot"
   [[ -f "$SURI_RULES_LIVE" ]] && cp -a "$SURI_RULES_LIVE" "$SURI_RULES_SNAP" 2>/dev/null
   infobox "Suricata Rules" "Fetching + validating rules (honouring enable.conf / disable.conf / drop.conf).\n\nEngine-incompatible rules are bypassed via disable.conf; the good rules still load. A truly broken set is rolled back — the sensor is never left down."
@@ -2105,7 +2063,7 @@ suricata_ips_enable(){
   yesno "Enable Suricata IPS" "Switch Suricata to INLINE IPS (NFQUEUE)?\n\n• Fail-open: if Suricata stops, traffic still flows (no outage)\n• Your SSH port ($SSH_PORT) is excluded from inspection (no lockout)\n• :443 VLESS-Reality is encrypted — IPS can't read its payload; value is\n  blocking scans/exploits against the host + management plane\n\nProceed?" 20 92 || return
   local suri_bin nftbin ncpu qmax i qargs="" qspec
   suri_bin=$(command -v suricata || echo /usr/bin/suricata)
-  have nft || run apt-get install -y nftables
+  have nft || apt_do install -y nftables
   nftbin=$(command -v nft || echo /usr/sbin/nft)
   ncpu=$(nproc 2>/dev/null || echo 1); qmax=$((ncpu-1)); (( qmax>3 )) && qmax=3; (( qmax<0 )) && qmax=0
   for ((i=0;i<=qmax;i++)); do qargs+=" -q $i"; done
@@ -2133,12 +2091,16 @@ table inet intelshield_ips {
         type filter hook input priority 100; policy accept;
         iif "lo" accept
         tcp dport $SSH_PORT accept
+        # M2-13 fix: conntrack fast-path — only queue NEW/unassessed flows
+        # Established connections skip the userspace queue (throughput + latency gain)
+        ct state established,related accept
         meta l4proto { tcp, udp } $qspec
     }
     chain output {
         type filter hook output priority 100; policy accept;
         oif "lo" accept
         tcp sport $SSH_PORT accept
+        ct state established,related accept
         meta l4proto { tcp, udp } $qspec
     }
 }
@@ -2156,13 +2118,27 @@ ExecStop=-$nftbin delete table inet intelshield_ips
 [Install]
 WantedBy=multi-user.target
 EOF
+  # H2-4 fix: detect Suricata engine version to set correct Type= for IPS drop-in
+  # Suricata 8+ (OISF PPA) uses Type=notify (foreground + sd_notify)
+  # Suricata 6/7 (Ubuntu archive) uses Type=forking with -D flag
+  local _suri_ver _suri_type="" _suri_flags=""
+  _suri_ver=$("$suri_bin" -V 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+  if [[ -n "$_suri_ver" ]] && printf '%s\n' "8.0" "$_suri_ver" | sort -V | tail -1 | grep -q "$_suri_ver"; then
+    _suri_type="Type=notify"
+    _suri_flags=""  # foreground mode, no -D
+  else
+    _suri_type="Type=forking"
+    _suri_flags=" -D"  # daemonize for Type=forking
+  fi
+  log "IPS drop-in: Suricata ${_suri_ver:-unknown} -> ${_suri_type:-Type=notify}"
   cat >"$SURICATA_IPS_DROPIN" <<EOF
 [Service]
-# override the packaged af-packet command with an inline NFQUEUE command
-Type=simple
-ExecStartPre=
+# H2-4 fix: pin the service type to match the engine version
+$_suri_type
+PIDFile=
 ExecStart=
-ExecStart=$suri_bin -c $SURICATA_YAML --pidfile /run/suricata.pid$qargs
+ExecStart=$suri_bin -c $SURICATA_YAML --pidfile /run/suricata.pid${_suri_flags}${qargs}
+TimeoutStartSec=180
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_IPC_LOCK CAP_SYS_RESOURCE
 Restart=on-failure
@@ -2202,7 +2178,7 @@ suricata_ips_teardown(){
   rm -f "$SURICATA_IPS_SVC" "$SURICATA_IPS_NFT"
   systemctl daemon-reload >>"$LOG" 2>&1 || true
   echo ids >"$SURICATA_MODE_FILE" 2>/dev/null || true
-  echo none >"$SURICATA_MUTEX_FILE" 2>/dev/null || true
+  atomic_state_write "$SURICATA_MUTEX_FILE" "none" 2>/dev/null || true
 }
 suricata_ips_disable(){
   [[ "$(suri_mode_get)" == ips ]] || { msg Suricata "Suricata is already in IDS (passive) mode."; return 3; }
@@ -2236,7 +2212,7 @@ suricata_ips_menu(){
   done
 }
 
-suricata_intel_menu(){ local c m; while :; do m=$(suri_mode_get); c=$(menu "Suricata IDS/IPS Management" "Mode: ${m^^}. Install, go inline, choose rules, tune and monitor." I "Install / repair Suricata" M "IDS <-> IPS inline mode (NFQUEUE)" F "Suricata 8 Firewall Mode (default-drop pipeline)" R "Rule management (sources / categories / drops)" T "Transaction rule management (enable/disable/drop.conf)" L "Tune for low-RAM VPS" H "Tune for high-throughput server" E "Enable encrypted-traffic metadata rules" J "Enable JA3/JA4/SNI/certificate monitoring" D "View packet drops" A "View top alerting signatures" S "Suppress noisy signatures" U "Update rules" X "Export eve.json summary" b Back) || break; case "$c" in I) suricata_repair;; M) suricata_ips_menu;; F) suricata_fw_menu;; R) suricata_rules_menu;; T) suricata_transactional_rules_menu;; L) suricata_tune_lowram;; H) suricata_tune_highthroughput;; E) suricata_enable_tls_metadata;; J) suricata_enable_ja;; D) suricata_packet_drops;; A) suricata_top_alerts;; S) suricata_suppress_signature;; U) suricata_update_rules;; X) suricata_export_eve_summary;; b) break;; esac; done; }
+suricata_intel_menu(){ local c m; while :; do m=$(suri_mode_get); c=$(menu "Suricata IDS/IPS Management" "Mode: ${m^^}. Install, go inline, choose rules, tune and monitor." I "Install / repair Suricata" M "IDS <-> IPS inline mode (NFQUEUE)" R "Rule management (sources / categories / drops)" T "Transaction rule management (enable/disable/drop.conf)" L "Tune for low-RAM VPS" H "Tune for high-throughput server" E "Enable encrypted-traffic metadata rules" J "Enable JA3/JA4/SNI/certificate monitoring" D "View packet drops" A "View top alerting signatures" S "Suppress noisy signatures" U "Update rules" X "Export eve.json summary" b Back) || break; case "$c" in I) suricata_repair;; M) suricata_ips_menu;; R) suricata_rules_menu;; T) suricata_transactional_rules_menu;; L) suricata_tune_lowram;; H) suricata_tune_highthroughput;; E) suricata_enable_tls_metadata;; J) suricata_enable_ja;; D) suricata_packet_drops;; A) suricata_top_alerts;; S) suricata_suppress_signature;; U) suricata_update_rules;; X) suricata_export_eve_summary;; b) break;; esac; done; }
 
 
 #==============================================================================
@@ -2285,7 +2261,7 @@ suricata_fw_mode_get(){ cat "$SURICATA_FW_MODE_FILE" 2>/dev/null || echo off; }
 # the packet path at a given priority level. This prevents conflicting nftables
 # chains from both trying to verdict the same packets.
 suricata_mutex_get(){ cat "$SURICATA_MUTEX_FILE" 2>/dev/null || echo none; }
-suricata_mutex_set(){ echo "$1" >"$SURICATA_MUTEX_FILE"; }
+suricata_mutex_set(){ atomic_state_write "$SURICATA_MUTEX_FILE" "$1"; }
 # Check if CrowdSec bouncer is actively managing nftables rules
 suricata_mutex_crowdsec_active(){
   have_cs && systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
@@ -2387,8 +2363,6 @@ suricata_fw_write_dropin(){
 #   2. protocol detection
 #   3. app:filter hooks (deep inspection, after protocol detection)
 #   4. default policy: DROP (if no accept:packet or accept:flow matched)
-Type=simple
-ExecStartPre=
 ExecStart=
 ExecStart=$suri_bin -c $SURICATA_YAML --pidfile /run/suricata.pid --firewall$qargs
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
@@ -2471,109 +2445,10 @@ EOF
 # Enable Suricata 8 Firewall Mode.
 # This replaces the traditional IDS/IPS mode with a deterministic packet pipeline.
 suricata_fw_enable(){
-  have suricata || { m_suricata || return 1; }
-
-  if ! suricata_fw_check_version; then
-    msg "Suricata 8 Firewall" "Suricata 8+ is required for Firewall Mode.\n\nCurrent version: $(suricata -V 2>/dev/null | tr -d '\n')\n\nThe OISF PPA ships Suricata 8 for Ubuntu 22.04/24.04. Run 'Install / repair Suricata' first."
-    return 1
-  fi
-
-  # Mutex check: if CrowdSec bouncer is active, warn about coexistence
-  if suricata_mutex_crowdsec_active; then
-    msg "Suricata 8 Firewall + CrowdSec" "CrowdSec firewall bouncer is currently active.\n\nSuricata 8 Firewall Mode and CrowdSec bouncer both use nftables chains. IntelShield will configure them with separate priorities:\n\n  CrowdSec:  priority ${SURICATA_CROWDSEC_PRIORITY} (edge, IP reputation)\n  Suricata:  priority ${SURICATA_FW_PRIORITY} (deep inspection)\n\nThis is the recommended layered configuration." 20 96
-  fi
-
-  yesno "Enable Suricata 8 Firewall Mode" "Switch Suricata to EXPERIMENTAL FIREWALL MODE?\n\nThis enables a DETERMINISTIC PACKET PIPELINE with DEFAULT-DROP policy:\n\n• Every packet NOT explicitly accepted is DROPPED (opposite of traditional IPS)\n• Uses Suricata 8's explicit action scopes: accept:packet, drop:flow, etc.\n• Rule hooks: packet:filter (fast path) + app:filter (deep inspection)\n• SSH port ($SSH_PORT) excluded from inspection (anti-lockout)\n• Fail-open: if Suricata stops, traffic still flows (no outage)\n\nWARNING: This is an experimental feature in Suricata 8.\nStart with alert-only rules, then enable drops after testing.\n\nProceed?" 22 96 || return
-
-  local nftbin; nftbin=$(command -v nft || echo /usr/sbin/nft)
-  have nft || run apt-get install -y nftables
-
-  # Take a pre-change snapshot for rollback
-  local bak; bak="$(suricata_yaml_backup)" || true
-
-  # Write the firewall mode components
-  suricata_fw_write_nft
-  local fw_rules; fw_rules="$(suricata_fw_write_rules)"
-  suricata_fw_write_dropin
-
-  # Wire the firewall rules into the ruleset
-  suricata_apply_dropin 60-firewall.yaml <<EOF
-# IntelShield override — Suricata 8 Firewall Mode configuration
-# Default-drop policy: traffic not matching any accept rule is dropped
-default-rule-path: /var/lib/suricata/rules
-rule-files:
-  - suricata.rules
-  - $SURICATA_LOCAL_RULES
-  - $fw_rules
-
-# Suricata 8 Firewall Mode engine settings
-app-layer:
-  protocols:
-    tls:
-      ja3-fingerprints: yes
-      ja4-fingerprints: yes
-    http:
-      enabled: yes
-    dns:
-      enabled: yes
-    ssh:
-      enabled: yes
-EOF
-  if [[ $? -ne 0 ]]; then
-    rm -f "$SURICATA_FW_NFT" "$SURICATA_FW_DROPIN"
-    [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$SURICATA_YAML"
-    msg "Suricata 8 Firewall" "Config validation failed — rolled back. See $LOG."
-    return 1
-  fi
-
-  # Install the nftables service
-  cat >"$SURICATA_FW_SVC" <<EOF
-[Unit]
-Description=IntelShield Suricata 8 Firewall Mode nftables rules
-After=nftables.service crowdsec-firewall-bouncer.service network-pre.target
-Wants=network-pre.target
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$nftbin -f $SURICATA_FW_NFT
-ExecStop=-$nftbin delete table inet ${SURICATA_FW_CHAIN}
-[Install]
-WantedBy=multi-user.target
-EOF
-  run systemctl daemon-reload
-  run systemctl enable "$(basename "$SURICATA_FW_SVC")"
-
-  # Load the nftables rules
-  if ! "$nftbin" -f "$SURICATA_FW_NFT" >>"$LOG" 2>&1; then
-    rm -f "$SURICATA_FW_NFT" "$SURICATA_FW_SVC" "$SURICATA_FW_DROPIN"
-    run systemctl daemon-reload
-    [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$SURICATA_YAML"
-    msg "Suricata 8 Firewall" "nftables firewall ruleset failed to load — aborted. See $LOG."
-    return 1
-  fi
-
-  run systemctl restart suricata
-  sleep 3
-
-  if systemctl is-active --quiet suricata; then
-    echo on >"$SURICATA_FW_MODE_FILE"
-    echo "suricata" >"$SURICATA_MUTEX_FILE"
-    state_write
-    msg "Suricata 8 Firewall Mode Active" "Suricata is now in EXPERIMENTAL FIREWALL MODE.\n\nPipeline: deterministic packet inspection → default DROP\nAction scopes: accept:packet, accept:flow, drop:flow, drop:packet\nRule hooks: packet:filter (fast) + app:filter (deep inspection)\n\nnftables priority: CrowdSec=${SURICATA_CROWDSEC_PRIORITY} | Suricata=${SURICATA_FW_PRIORITY}\n\nFail-open and SSH-exclusion are enforced at the kernel level.\n\nStart with alert-only rules, then enable drops via IPS blocking policy." 22 96
-    return 0
-  fi
-
-  # Rollback: service didn't come up
-  rm -f "$SURICATA_FW_DROPIN"
-  "$nftbin" delete table inet "${SURICATA_FW_CHAIN}" 2>/dev/null || true
-  run systemctl disable --now "$(basename "$SURICATA_FW_SVC")" 2>/dev/null || true
-  rm -f "$SURICATA_FW_SVC" "$SURICATA_FW_NFT"
-  run systemctl daemon-reload
-  [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$SURICATA_YAML"
-  run systemctl restart suricata || true
-  echo ids >"$SURICATA_MODE_FILE"; echo off >"$SURICATA_FW_MODE_FILE"
-  suricata_mutex_set none; state_write
-  msg "Suricata 8 Firewall" "Firewall mode failed to start — auto-reverted to IDS. Traffic was never blocked (fail-open). See $LOG."
+  # v9.8: Firewall Mode disabled — 4 independent defects (see AUDIT-REPORT C-2)
+  # No accept rules, wrong config key, invalid entropy syntax, wrong CLI flag.
+  # Disabled pending a proper rewrite against Suricata 8 OISF documentation.
+  msg "Suricata 8 Firewall Mode" "Firewall Mode is DISABLED in v9.8.\n\nThis experimental feature has multiple defects that can cause total traffic loss.\nUse IPS mode (--suricata-ips on) for inline blocking instead."
   return 1
 }
 
@@ -2590,7 +2465,7 @@ suricata_fw_teardown(){
   suricata_write_include_block 2>/dev/null || true
   systemctl daemon-reload >>"$LOG" 2>&1 || true
   echo off >"$SURICATA_FW_MODE_FILE" 2>/dev/null || true
-  echo none >"$SURICATA_MUTEX_FILE" 2>/dev/null || true
+  atomic_state_write "$SURICATA_MUTEX_FILE" "none" 2>/dev/null || true
 }
 
 # Disable Suricata 8 Firewall Mode and revert to IDS
@@ -2904,7 +2779,37 @@ suricata_apply_transactional_rules(){
 }
 
 #----------------------------- Wazuh Agent Integration ------------------------
-wazuh_add_repo(){ run apt-get update || true; run apt-get install -y gnupg apt-transport-https curl ca-certificates; if [[ ! -f /usr/share/keyrings/wazuh.gpg ]]; then curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import >>"$WAZUH_LOG" 2>&1; chmod 644 /usr/share/keyrings/wazuh.gpg; fi; echo 'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' >/etc/apt/sources.list.d/wazuh.list; run apt-get update; }
+wazuh_add_repo(){
+  local KEYRING="/usr/share/keyrings/wazuh.gpg"
+  apt_do update || true;
+  apt_do install -y gnupg apt-transport-https curl ca-certificates;
+  # Verify the key actually landed; retry/repair rather than trusting file existence
+  if ! gpg --no-default-keyring --keyring "gnupg-ring:$KEYRING" --list-keys >/dev/null 2>&1; then
+    rm -f "$KEYRING"
+    if ! curl -fsSL --proto '=https' --tlsv1.2 https://packages.wazuh.com/key/GPG-KEY-WAZUH \
+         | gpg --no-default-keyring --keyring "gnupg-ring:$KEYRING" --import >>"$WAZUH_LOG" 2>&1; then
+      rm -f "$KEYRING"; log "wazuh_add_repo: GPG key import FAILED"; return 1
+    fi
+    chmod 644 "$KEYRING"
+  fi;
+  # Remove stale .list when writing .sources (prevents "configured multiple times" warnings)
+  rm -f /etc/apt/sources.list.d/wazuh.list
+  if [[ "$OS_CODENAME" == "noble" ]]; then
+    cat >/etc/apt/sources.list.d/wazuh.sources <<'DEB822'
+Types: deb
+URIs: https://packages.wazuh.com/4.x/apt/
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/wazuh.gpg
+DEB822
+    log "wazuh_add_repo: installed deb822 .sources for noble"
+  else
+    echo 'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
+      >/etc/apt/sources.list.d/wazuh.list;
+    log "wazuh_add_repo: installed legacy .list for ${OS_CODENAME:-unknown}"
+  fi;
+  apt_do update;
+}
 wazuh_write_helper(){ cat >"$WAZUH_HELPER" <<'EOF'
 #!/usr/bin/env bash
 # emit exactly one JSON object; is-active/is-enabled print AND return non-zero, so
@@ -2962,24 +2867,24 @@ OUTDIR="/var/log/intelshield/wazuh-active-response"; mkdir -p "$OUTDIR"; TS="$(d
 exit 0
 EOF
 chmod 750 "$WAZUH_AR_SCRIPT"; state_write; msg "Wazuh Safe Active Response" "Safe evidence-only response installed. Configure triggers on Wazuh manager side."; }
-wazuh_install_agent(){ local manager agent_name agent_group regpass opts=(); manager="$(input "Wazuh Agent" "Wazuh Manager IP/FQDN:" "")" || return 3; [[ -n "$manager" ]] || { msg "Wazuh Agent" "Manager address is required."; return 1; }; agent_name="$(input "Wazuh Agent" "Agent name shown in Wazuh dashboard:" "$(hostname)-intelshield")" || return 3; agent_group="$(input "Wazuh Agent" "Agent group, optional:" "intelshield")" || return 3; regpass="$(secret_input "Wazuh Agent" "Enrollment password/key, optional (hidden):")" || return 3; do_backup >/dev/null 2>&1 || true; wazuh_add_repo; [[ -n "$agent_name" ]] && opts+=("WAZUH_AGENT_NAME=$agent_name"); [[ -n "$agent_group" ]] && opts+=("WAZUH_AGENT_GROUP=$agent_group"); [[ -n "$regpass" ]] && opts+=("WAZUH_REGISTRATION_PASSWORD=$regpass"); if ! env WAZUH_MANAGER="$manager" "${opts[@]}" apt-get install -y wazuh-agent >>"$WAZUH_LOG" 2>&1; then msg "Wazuh Agent" "apt-get install wazuh-agent FAILED — integration not configured. See $WAZUH_LOG."; return 1; fi; run systemctl daemon-reload || true; run systemctl enable --now wazuh-agent; wazuh_write_helper; wazuh_configure_logs; wazuh_configure_active_response_safe; state_write; msg "Wazuh Agent" "Installed and IntelShield integration configured."; }
+wazuh_install_agent(){ local manager agent_name agent_group regpass opts=(); manager="$(input "Wazuh Agent" "Wazuh Manager IP/FQDN:" "")" || return 3; [[ -n "$manager" ]] || { msg "Wazuh Agent" "Manager address is required."; return 1; }; agent_name="$(input "Wazuh Agent" "Agent name shown in Wazuh dashboard:" "$(hostname)-intelshield")" || return 3; agent_group="$(input "Wazuh Agent" "Agent group, optional:" "intelshield")" || return 3; regpass="$(secret_input "Wazuh Agent" "Enrollment password/key, optional (hidden):")" || return 3; do_backup >/dev/null 2>&1 || true; wazuh_add_repo; [[ -n "$agent_name" ]] && opts+=("WAZUH_AGENT_NAME=$agent_name"); [[ -n "$agent_group" ]] && opts+=("WAZUH_AGENT_GROUP=$agent_group"); [[ -n "$regpass" ]] && opts+=("WAZUH_REGISTRATION_PASSWORD=$regpass"); if ! env WAZUH_MANAGER="$manager" "${opts[@]}" apt_do install -y wazuh-agent >>"$WAZUH_LOG" 2>&1; then msg "Wazuh Agent" "apt-get install wazuh-agent FAILED — integration not configured. See $WAZUH_LOG."; return 1; fi; run systemctl daemon-reload || true; run systemctl enable --now wazuh-agent; wazuh_write_helper; wazuh_configure_logs; wazuh_configure_active_response_safe; state_write; msg "Wazuh Agent" "Installed and IntelShield integration configured."; }
 wazuh_status(){ state_write; { echo "IntelShield Wazuh Agent Status - $(date -Is)"; echo; systemctl status wazuh-agent --no-pager 2>/dev/null || echo "wazuh-agent service not found"; echo; /var/ossec/bin/wazuh-control status 2>/dev/null || true; echo; echo "== state =="; jq . "$STATE_DB" 2>/dev/null || cat "$STATE_DB" 2>/dev/null || true; } >"$IS_TMP/wazuh-status.txt"; showfile "Wazuh Agent Status" "$IS_TMP/wazuh-status.txt" 34 118; }
 wazuh_health(){ local f="$IS_TMP/wazuh-health.txt"; state_write; { echo "IntelShield Wazuh Integration Health - $(date -Is)"; [[ -x /var/ossec/bin/wazuh-control ]] && echo "OK agent binaries present" || echo "FAIL binaries missing"; systemctl is-active --quiet wazuh-agent && echo "OK wazuh-agent active" || echo "FAIL wazuh-agent inactive"; grep -q 'INTELSHIELD-WAZUH-MANAGED-START' "$WAZUH_OSSEC" 2>/dev/null && echo "OK managed ossec.conf block present" || echo "FAIL managed block missing"; [[ -x "$WAZUH_HELPER" ]] && echo "OK command/status helper present" || echo "FAIL helper missing"; [[ -x "$WAZUH_AR_SCRIPT" ]] && echo "OK safe active response script present" || echo "WARN safe active response missing"; } >"$f"; showfile "Wazuh Integration Health" "$f" 34 118; }
 wazuh_repair(){ wazuh_agent_present || { msg "Wazuh Repair" "Wazuh agent missing. Install it first."; return 1; }; do_backup >/dev/null 2>&1 || true; wazuh_write_helper; wazuh_configure_logs; wazuh_configure_active_response_safe; run systemctl restart wazuh-agent || true; state_write; msg "Wazuh Repair" "Wazuh integration repaired."; }
-wazuh_remove_integration(){ wazuh_agent_present || { msg "Wazuh Remove" "Wazuh agent is not installed."; return 3; }; yesno "Remove Wazuh Integration" "Remove IntelShield-managed Wazuh config and safe active response?" || return 3; do_backup >/dev/null 2>&1 || true; cp -a "$WAZUH_OSSEC" "$WAZUH_OSSEC.intelshield.remove.bak.$(date +%s)" 2>/dev/null || true; wazuh_strip_managed_block; rm -f "$WAZUH_HELPER" "$WAZUH_AR_SCRIPT"; run systemctl restart wazuh-agent || true; if yesno "Purge Wazuh Agent?" "Also purge wazuh-agent package? Choose No if used by other policy."; then run systemctl disable --now wazuh-agent || true; run apt-get purge -y wazuh-agent || true; run apt-get autoremove -y || true; fi; state_write; msg "Wazuh Remove" "IntelShield Wazuh integration removed safely."; }
+wazuh_remove_integration(){ wazuh_agent_present || { msg "Wazuh Remove" "Wazuh agent is not installed."; return 3; }; yesno "Remove Wazuh Integration" "Remove IntelShield-managed Wazuh config and safe active response?" || return 3; do_backup >/dev/null 2>&1 || true; cp -a "$WAZUH_OSSEC" "$WAZUH_OSSEC.intelshield.remove.bak.$(date +%s)" 2>/dev/null || true; wazuh_strip_managed_block; rm -f "$WAZUH_HELPER" "$WAZUH_AR_SCRIPT"; run systemctl restart wazuh-agent || true; if yesno "Purge Wazuh Agent?" "Also purge wazuh-agent package? Choose No if used by other policy."; then run systemctl disable --now wazuh-agent || true; apt_do purge -y wazuh-agent || true; apt_do autoremove -y || true; fi; state_write; msg "Wazuh Remove" "IntelShield Wazuh integration removed safely."; }
 wazuh_menu(){ local c; while :; do c=$(menu "Wazuh SIEM / XDR Integration" "Agent-only integration. Wazuh Manager installation is intentionally skipped." I "Install Wazuh Agent" L "Configure IntelShield → Wazuh log forwarding" F "Configure Wazuh FIM for IntelShield paths" C "Configure Wazuh command/status collection" A "Configure Wazuh active response — safe mode" S "View Wazuh agent status" H "View Wazuh integration health" R "Repair Wazuh integration" X "Remove Wazuh integration safely" b Back) || break; case "$c" in I) wazuh_install_agent;; L) wazuh_configure_logs;; F) wazuh_configure_fim;; C) wazuh_configure_commands;; A) wazuh_configure_active_response_safe;; S) wazuh_status;; H) wazuh_health;; R) wazuh_repair;; X) wazuh_remove_integration;; b) break;; esac; done; }
 
 
 #----------------------------- Profiles ---------------------------------------
 profile_details(){ case "$1" in vps-balanced) echo "Installs/enables: baseline, kernel tuning/security, CPU/platform audit, UFW, CrowdSec+bouncer, health. Disables heavy audit/IDS/AV timers.";; vps-high) echo "Installs/enables: VPS balanced + SSH hardening, Suricata, Suricata->CrowdSec, ClamAV, auditd, Anti-rootkit.";; baremetal-high) echo "Installs/enables: VPS high + AIDE, AppArmor, high-throughput Suricata.";; vpn-performance) echo "Installs/enables: baseline, BBR, CPU audit, UFW, CrowdSec+bouncer, health. Disables heavy services.";; forensic-audit) echo "Installs/enables: auditd, AIDE, Suricata, CrowdSec wiring, ClamAV, Anti-rootkit, forensics.";; minimal-safe) echo "Installs/enables: baseline, kernel security, UFW, CrowdSec+bouncer, health. Disables heavy services.";; esac; }
 profile_disable_heavy(){ [[ "$(suri_mode_get)" == ips ]] && suricata_ips_teardown; [[ "$(suricata_fw_mode_get)" == on ]] && suricata_fw_teardown; run systemctl disable --now suricata || true; run systemctl disable --now auditd || true; run systemctl disable --now intelshield-clamscan-full.timer || true; run systemctl disable --now intelshield-clamscan-smart.timer || true; run systemctl disable --now intelshield-antirootkit-rkhunter.timer || true; run systemctl disable --now intelshield-antirootkit-chkrootkit.timer || true; }
-profile_apply(){ local profile="$1" mods=(); yesno "Apply Profile" "$(profile_details "$profile")\n\nSwitching profiles is safe: needed modules are installed/enabled; downgrade profiles disable heavy components instead of purging packages.\n\nProceed?" 20 100 || return; do_backup >/dev/null 2>&1 || true; case "$profile" in vps-balanced) profile_disable_heavy; mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_crowdsec m_bouncer m_health_timer);; vps-high) mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_ssh m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_ark_install m_health_timer);; baremetal-high) mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_ssh m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_aide m_apparmor m_ark_install m_health_timer suricata_tune_highthroughput);; vpn-performance) profile_disable_heavy; mods=(m_baseline m_kernel_network m_cpu_microcode m_ufw m_crowdsec m_bouncer m_health_timer);; forensic-audit) mods=(m_baseline m_kernel_security m_cpu_microcode m_platform_security m_ufw m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_aide m_ark_install m_health_timer);; minimal-safe) profile_disable_heavy; mods=(m_baseline m_kernel_security m_ufw m_crowdsec m_bouncer m_health_timer);; *) msg Profile "Unknown profile: $profile"; return 1;; esac; for fn in "${mods[@]}"; do $fn || true; done; echo "$profile" >"$PROFILE_FILE"; state_write; msg "Profile Applied" "Active profile: $profile"; }
+profile_apply(){ local profile="$1" mods=(); yesno "Apply Profile" "$(profile_details "$profile")\n\nSwitching profiles is safe: needed modules are installed/enabled; downgrade profiles disable heavy components instead of purging packages.\n\nProceed?" 20 100 || return; do_backup >/dev/null 2>&1 || true; case "$profile" in vps-balanced) profile_disable_heavy; mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_crowdsec m_bouncer m_health_timer);; vps-high) mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_ssh m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_ark_install m_health_timer);; baremetal-high) mods=(m_baseline m_kernel_network m_kernel_security m_cpu_microcode m_platform_security m_ufw m_ssh m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_aide m_apparmor m_ark_install m_health_timer suricata_tune_highthroughput);; vpn-performance) profile_disable_heavy; mods=(m_baseline m_kernel_network m_cpu_microcode m_ufw m_crowdsec m_bouncer m_health_timer);; forensic-audit) mods=(m_baseline m_kernel_security m_cpu_microcode m_platform_security m_ufw m_crowdsec m_bouncer m_suricata m_wiring m_clamav_install m_auditd m_aide m_ark_install m_health_timer);; minimal-safe) profile_disable_heavy; mods=(m_baseline m_kernel_security m_ufw m_crowdsec m_bouncer m_health_timer);; *) msg Profile "Unknown profile: $profile"; return 1;; esac; for fn in "${mods[@]}"; do $fn || true; done; atomic_state_write "$PROFILE_FILE" "$profile"; state_write; msg "Profile Applied" "Active profile: $profile"; }
 profiles_menu(){ local c; while :; do c=$(menu "IntelShield Profiles" "Choose a production profile. Existing packages are not purged when downgrading; heavy services/timers are disabled cleanly." 1 "VPS balanced" 2 "VPS high-security" 3 "Bare-metal high-security" 4 "VPN relay performance" 5 "Forensic/audit mode" 6 "Minimal safe mode" V "View current state" R "Run preflight risk engine" b Back) || break; case "$c" in 1) profile_apply vps-balanced;; 2) profile_apply vps-high;; 3) profile_apply baremetal-high;; 4) profile_apply vpn-performance;; 5) profile_apply forensic-audit;; 6) profile_apply minimal-safe;; V) state_view;; R) preflight_risk_engine;; b) break;; esac; done; }
 
 
 # ---------- uninstall / revert ----------------------------------------------
-uninstall_configs(){ yesno Uninstall "Remove IntelShield-managed configs/timers/drop-ins? A backup will be created first." || return; do_backup >/dev/null 2>&1 || true; suricata_ips_teardown; suricata_fw_teardown; for t in intelshield-health intelshield-clamscan-full intelshield-clamscan-smart intelshield-antirootkit-rkhunter intelshield-antirootkit-chkrootkit; do run systemctl disable --now ${t}.timer || true; rm -f /etc/systemd/system/${t}.service /etc/systemd/system/${t}.timer; done; run systemctl disable --now intelshield-cpu.service 2>/dev/null || true; rm -f "$SYSCTL_NET" "$SYSCTL_SEC" "$PERF_SYSCTL" "$ACQUIS_FILE" "$ALLOWLIST_FILE" "$CRON_FILE" /etc/modules-load.d/intelshield-bbr.conf /etc/rkhunter.conf.local "$ARK_CONF" "$SURICATA_LOCAL_RULES" "$UPGRADE_BLACKLIST" "$UPDATE_AUTOCONF"; rm -f "$MAINT_CRON" "$MAINT_LOGROTATE" "$UPDATE_CONF" /etc/logrotate.d/intelshield-suricata; rm -rf "$SURICATA_INCLUDE_DIR"; suricata_write_include_block 2>/dev/null || true; rmdir "$SURICATA_INCLUDE_DIR" 2>/dev/null || true; rm -f /etc/systemd/system/x-ui.service.d/99-intelshield-sandbox.conf /etc/systemd/system/xray.service.d/99-intelshield-sandbox.conf /etc/audit/rules.d/99-intelshield.rules /etc/systemd/system/intelshield-cpu.service /usr/local/sbin/intelshield-health; if yesno_danger "Revert SSH hardening?" "Also remove the IntelShield SSH drop-in (/etc/ssh/sshd_config.d/99-harden.conf)? This restores the previous SSH port/crypto policy."; then rm -f /etc/ssh/sshd_config.d/99-harden.conf; sshd -t 2>>"$LOG" && { run systemctl reload ssh || run systemctl reload sshd; }; fi; wazuh_strip_managed_block || true; run systemctl daemon-reload; run sysctl --system || true; state_write; msg Uninstall "IntelShield configs removed (Suricata IPS plumbing, timers, drop-ins). Backups/state preserved.\nNote: the canonical copy at /usr/local/sbin/intelshield was left in place."; }
-purge_packages_prompt(){ local sel; sel=$(checklist "Purge Packages" "Select only items you do not use elsewhere." crowdsec "CrowdSec + bouncer" OFF suricata "Suricata" OFF clamav "ClamAV" OFF auditd "auditd" OFF aide "AIDE" OFF rkhunter "rkhunter" OFF chkrootkit "chkrootkit" OFF wazuh "Wazuh agent" OFF ufw "UFW" OFF) || return; sel=${sel//\"/}; [[ -z "$sel" ]] && return; yesno Purge "Purge: $sel ?" || return; case " $sel " in *" crowdsec "*) run apt-get purge -y crowdsec crowdsec-firewall-bouncer-nftables;; esac; case " $sel " in *" suricata "*) run apt-get purge -y suricata suricata-update;; esac; case " $sel " in *" clamav "*) run apt-get purge -y 'clamav*';; esac; case " $sel " in *" auditd "*) run apt-get purge -y auditd audispd-plugins;; esac; case " $sel " in *" aide "*) run apt-get purge -y aide aide-common;; esac; case " $sel " in *" rkhunter "*) run apt-get purge -y rkhunter;; esac; case " $sel " in *" chkrootkit "*) run apt-get purge -y chkrootkit;; esac; case " $sel " in *" wazuh "*) run systemctl disable --now wazuh-agent || true; run apt-get purge -y wazuh-agent;; esac; case " $sel " in *" ufw "*) run ufw disable || true; run apt-get purge -y ufw;; esac; run apt-get autoremove -y; state_write; msg Purge Done; }
+uninstall_configs(){ yesno Uninstall "Remove IntelShield-managed configs/timers/drop-ins? A backup will be created first." || return; do_backup >/dev/null 2>&1 || true; suricata_ips_teardown; suricata_fw_teardown; for t in intelshield-health intelshield-clamscan-full intelshield-clamscan-smart intelshield-antirootkit-rkhunter intelshield-antirootkit-chkrootkit; do run systemctl disable --now ${t}.timer || true; rm -f /etc/systemd/system/${t}.service /etc/systemd/system/${t}.timer; done; run systemctl disable --now intelshield-cpu.service 2>/dev/null || true; rm -f "$SYSCTL_NET" "$SYSCTL_SEC" "$PERF_SYSCTL" "$ACQUIS_FILE" "$ALLOWLIST_FILE" "$CRON_FILE" /etc/modules-load.d/intelshield-bbr.conf /etc/rkhunter.conf.local "$ARK_CONF" "$SURICATA_LOCAL_RULES" "$UPGRADE_BLACKLIST" "$UPDATE_AUTOCONF"; rm -f "$MAINT_CRON" "$MAINT_LOGROTATE" "$UPDATE_CONF" /etc/logrotate.d/intelshield-suricata; rm -rf "$SURICATA_INCLUDE_DIR"; suricata_write_include_block 2>/dev/null || true; rmdir "$SURICATA_INCLUDE_DIR" 2>/dev/null || true; rm -f /etc/audit/rules.d/99-intelshield.rules /etc/systemd/system/intelshield-cpu.service /usr/local/sbin/intelshield-health; if yesno_danger "Revert SSH hardening?" "Also remove the IntelShield SSH drop-in (/etc/ssh/sshd_config.d/99-harden.conf)? This restores the previous SSH port/crypto policy."; then rm -f /etc/ssh/sshd_config.d/99-harden.conf; sshd -t 2>>"$LOG" && { run systemctl reload ssh || run systemctl reload sshd; }; fi; wazuh_strip_managed_block || true; run systemctl daemon-reload; run sysctl --system || true; state_write; msg Uninstall "IntelShield configs removed (Suricata IPS plumbing, timers, drop-ins). Backups/state preserved.\nNote: the canonical copy at /usr/local/sbin/intelshield was left in place."; }
+purge_packages_prompt(){ local sel; sel=$(checklist "Purge Packages" "Select only items you do not use elsewhere." crowdsec "CrowdSec + bouncer" OFF suricata "Suricata" OFF clamav "ClamAV" OFF auditd "auditd" OFF aide "AIDE" OFF rkhunter "rkhunter" OFF chkrootkit "chkrootkit" OFF wazuh "Wazuh agent" OFF ufw "UFW" OFF) || return; sel=${sel//\"/}; [[ -z "$sel" ]] && return; yesno Purge "Purge: $sel ?" || return; case " $sel " in *" crowdsec "*) apt_do purge -y crowdsec crowdsec-firewall-bouncer-nftables;; esac; case " $sel " in *" suricata "*) apt_do purge -y suricata suricata-update;; esac; case " $sel " in *" clamav "*) apt_do purge -y 'clamav*';; esac; case " $sel " in *" auditd "*) apt_do purge -y auditd audispd-plugins;; esac; case " $sel " in *" aide "*) apt_do purge -y aide aide-common;; esac; case " $sel " in *" rkhunter "*) apt_do purge -y rkhunter;; esac; case " $sel " in *" chkrootkit "*) apt_do purge -y chkrootkit;; esac; case " $sel " in *" wazuh "*) run systemctl disable --now wazuh-agent || true; apt_do purge -y wazuh-agent;; esac; case " $sel " in *" ufw "*) run ufw disable || true; apt_do purge -y ufw;; esac; apt_do autoremove -y; state_write; msg Purge Done; }
 #==============================================================================
 #  COMPONENT CONTROL CENTER  (granular per-module disable / remove / purge)
 #==============================================================================
@@ -2996,7 +2901,6 @@ COMPONENTS=(
   "aide|AIDE file integrity||aide aide-common||"
   "antirootkit|rkhunter + chkrootkit||rkhunter chkrootkit|/etc/rkhunter.conf.local $ARK_CONF|comp_hook_antirootkit"
   "wazuh|Wazuh agent integration|wazuh-agent.service|wazuh-agent||comp_hook_wazuh"
-  "sandbox|x-ui/Xray systemd sandbox|||/etc/systemd/system/x-ui.service.d/99-intelshield-sandbox.conf /etc/systemd/system/xray.service.d/99-intelshield-sandbox.conf|comp_hook_sandbox"
   "ufw|UFW firewall||ufw||comp_hook_ufw"
   "kernelnet|Kernel network + BBR sysctls|||$SYSCTL_NET /etc/modules-load.d/intelshield-bbr.conf|comp_hook_sysctl"
   "kernelsec|Kernel security sysctls|||$SYSCTL_SEC|comp_hook_sysctl"
@@ -3029,7 +2933,6 @@ comp_hook_suricata(){ [[ "$(suri_mode_get)" == ips ]] && suricata_ips_teardown  
 comp_hook_clamav(){ local t; for t in full smart; do run systemctl disable --now "intelshield-clamscan-${t}.timer" 2>/dev/null || true; [[ "$1" == remove ]] && rm -f "/etc/systemd/system/intelshield-clamscan-${t}.service" "/etc/systemd/system/intelshield-clamscan-${t}.timer"; done; run systemctl daemon-reload; }
 comp_hook_antirootkit(){ ark_disable_schedule rkhunter; ark_disable_schedule chkrootkit; }
 comp_hook_auditd(){ [[ "$1" == remove ]] && run augenrules --load || true; }
-comp_hook_sandbox(){ log "comp_hook_sandbox: immutability engine (no action needed)"; }
 comp_hook_wazuh(){ wazuh_strip_managed_block || true; [[ "$1" == remove ]] && rm -f "$WAZUH_HELPER" "$WAZUH_AR_SCRIPT"; systemctl is-active --quiet wazuh-agent && run systemctl restart wazuh-agent || true; }
 comp_hook_ufw(){ run ufw disable || true; }
 comp_hook_sysctl(){ [[ "$1" == remove ]] && { run systemctl daemon-reload; run sysctl --system || true; }; }
@@ -3048,7 +2951,7 @@ comp_disable(){ local entry tag label units pkgs cfgs hook u mode="${2:-disable}
   msg "$label" "$([[ "$mode" == remove ]] && echo 'Disabled and IntelShield config removed. Packages kept.' || echo 'Stopped and disabled. Config + packages kept — re-enable any time.')"; }
 comp_purge(){ local entry tag label units pkgs cfgs hook arr; entry=$(comp_lookup "$1") || return 1; IFS='|' read -r tag label units pkgs cfgs hook <<<"$entry"
   [[ -z "$pkgs" ]] && { msg "$label" "Config-only component — use Remove instead."; return 3; }
-  comp_disable "$1" remove; read -ra arr <<<"$pkgs"; run apt-get purge -y "${arr[@]}"; run apt-get autoremove -y; state_write; msg "$label" "Purged packages: $pkgs"; }
+  comp_disable "$1" remove; read -ra arr <<<"$pkgs"; apt_do purge -y "${arr[@]}"; apt_do autoremove -y; state_write; msg "$label" "Purged packages: $pkgs"; }
 
 comp_action_menu(){ local entry tag label units pkgs cfgs hook a; entry=$(comp_lookup "$1") || return; IFS='|' read -r tag label units pkgs cfgs hook <<<"$entry"
   a=$(menu "$label" "Units: ${units:-none}\nPackages: ${pkgs:-none}\nStatus: $(comp_state_line "$units")" \
@@ -3311,7 +3214,7 @@ forensics_menu(){
       C) { echo -e "⚡ TRACING LOGICAL ESTABLISHED STREAM ARRAYS ⚡\n"; ss -toea | sed 's/ users:(/\n\tMapped Consumers: (/g'; } > "$f_tmp"
          showfile "Forensics: Active Network Streams" "$f_tmp" ;;
       T) if ! command -v tcpdump >/dev/null 2>&1; then
-           if yesno "Network Capture Pipeline" "tcpdump is not installed.\n\nInstall it now (apt-get install tcpdump)?"; then run apt-get install -y tcpdump; fi
+           if yesno "Network Capture Pipeline" "tcpdump is not installed.\n\nInstall it now (apt-get install tcpdump)?"; then apt_do install -y tcpdump; fi
          fi
          if ! command -v tcpdump >/dev/null 2>&1; then
            msg "Network Capture Pipeline" "tcpdump unavailable — cannot capture. See $LOG."
@@ -3488,9 +3391,7 @@ MODULES=(
   "apparmor|AppArmor (MAC profiles)|m_apparmor|OFF"
   "usg|USG CIS audit-only|m_usg_audit|OFF"
   "antirootkit|Anti-rootkit (rkhunter + chkrootkit)|m_ark_install|OFF"
-  "sandbox|System immutability engine|system_lock|OFF"
   "console|CrowdSec console enroll (optional)|m_console|OFF"
-  "panel|x-ui panel protection helper (optional)|m_panel|OFF"
   "health|Health-check timer|m_health_timer|ON"
 )
 
@@ -3510,7 +3411,7 @@ run_module(){
 }
 
 summary(){
-  local out="" tag
+  local out="" tag m
   for m in "${MODULES[@]}"; do
     tag="${m%%|*}"
     [[ -n "${RESULT[$tag]:-}" ]] && out+="${RESULT[$tag]}"$'\n'
@@ -3521,7 +3422,7 @@ summary(){
 }
 
 select_modules(){
-  local CHK_ARGS=() tag desc fn state sel
+  local CHK_ARGS=() tag desc fn state sel m
   for m in "${MODULES[@]}"; do
     IFS='|' read -r tag desc fn state <<<"$m"
     CHK_ARGS+=("$tag" "$desc" "$state")
@@ -3542,7 +3443,7 @@ select_modules(){
 
 guided(){
   preflight_risk_engine
-  local seq=(backup baseline kernelnet kernelsec cpu platform ufw crowdsec allowlist bouncer suricata wiring auditd health) tag desc fn state want
+  local seq=(backup baseline kernelnet kernelsec cpu platform ufw crowdsec allowlist suricata wiring auditd health) tag desc fn state want m
   RESULT=(); COUNTER=0; TOTAL=${#seq[@]}
   for want in "${seq[@]}"; do
     for m in "${MODULES[@]}"; do
@@ -3664,7 +3565,7 @@ crowdsec_menu(){
 ufw_present(){ command -v ufw >/dev/null 2>&1; }
 ufw_ensure(){
   ufw_present && return 0
-  yesno "UFW Firewall" "UFW is not installed.\n\nInstall it now (apt-get install ufw)?" && run apt-get install -y ufw
+  yesno "UFW Firewall" "UFW is not installed.\n\nInstall it now (apt-get install ufw)?" && apt_do install -y ufw
   ufw_present
 }
 ufw_active(){ ufw status 2>/dev/null | grep -q "Status: active"; }
@@ -3766,6 +3667,7 @@ ufw_toggle(){
     run ufw allow 443/tcp
     run ufw allow 443/udp
     run ufw --force enable
+    ufw_install_resync_hook
     msg "UFW Enabled" "Firewall is ACTIVE.\n\nAnti-lockout safety: SSH/${SSH_PORT} (rate-limited), 443/tcp and 443/udp were allowed before enabling."
   fi
 }
@@ -3821,7 +3723,7 @@ clamlog(){ mkdir -p "$(dirname "$CLAMAV_LOG")" 2>/dev/null; printf '[%s UTC] %s\
 
 # spec: detect APT / YUM / DNF / Pacman  (routed through run() so it streams live)
 pkg_install(){
-  if   command -v apt-get >/dev/null 2>&1; then run apt-get update -y; run apt-get install -y "$@"
+  if   command -v apt-get >/dev/null 2>&1; then apt_do update -y; apt_do install -y "$@"
   elif command -v dnf     >/dev/null 2>&1; then run dnf install -y "$@"
   elif command -v yum     >/dev/null 2>&1; then run yum install -y "$@"
   elif command -v pacman  >/dev/null 2>&1; then run pacman -Sy --noconfirm "$@"
@@ -3860,7 +3762,7 @@ m_clamav_install(){
     run systemctl stop clamav-freshclam
     run systemctl stop clamav-daemon
     run systemctl stop clamav-clamonacc
-    if   command -v apt-get >/dev/null 2>&1; then apt-get purge -y 'clamav*' >>"$LOG" 2>&1; apt-get autoremove -y >>"$LOG" 2>&1
+    if   command -v apt-get >/dev/null 2>&1; then apt_do purge -y 'clamav*'; apt_do autoremove -y
     elif command -v dnf     >/dev/null 2>&1; then dnf remove -y 'clamav*' >>"$LOG" 2>&1
     elif command -v yum     >/dev/null 2>&1; then yum remove -y 'clamav*' >>"$LOG" 2>&1
     elif command -v pacman  >/dev/null 2>&1; then pacman -Rns --noconfirm clamav >>"$LOG" 2>&1
@@ -4019,10 +3921,22 @@ clam_toggle_realtime(){
     clamlog "on-access disabled"
     msg "Real-Time OFF" "On-access scanning disabled."
   else
-    yesno "Real-Time Protection" "Enable on-access (real-time) scanning?\n\nStarts clamd + clamonacc and uses notably more RAM. On a pure relay this is usually unnecessary — scheduled scans are lighter." || return
+    # H2-11 fix: gate on MemTotal — clamd RSS alone is ~1.2-1.5 GB, will OOM a 1 GB box
+    local mem_kb; mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    local mem_mb=$(( ${mem_kb:-0} / 1024 ))
+    if (( mem_mb < 2048 )); then
+      msg "Insufficient RAM" "On-access scanning requires ≥2 GB RAM (detected: ${mem_mb} MB).\n\nclamd alone uses ~1.2-1.5 GB RSS — on this host it would trigger the OOM-killer.\n\nUse scheduled scans instead (they run and exit, freeing memory)."
+      return 1
+    fi
+    yesno "Real-Time Protection" "Enable on-access (real-time) scanning?\n\nStarts clamd + clamonacc and uses notably more RAM (~1.2-1.5 GB).\nDetected RAM: ${mem_mb} MB.\n\nOn a pure relay this is usually unnecessary — scheduled scans are lighter." || return
+    # Set safe bounds for on-access scanning
     clam_conf_set "OnAccessIncludePath" "/home"
     clam_conf_set "OnAccessPrevention" "false"
     clam_conf_set "OnAccessExcludeUname" "clamav"
+    clam_conf_set "OnAccessMaxFileSize" "10485760"
+    clam_conf_set "OnAccessDisableDDD" "true"
+    clam_conf_set "MaxThreads" "4"
+    clam_conf_set "MaxQueue" "64"
     run systemctl enable --now clamav-daemon
     run systemctl enable --now clamav-clamonacc
     sleep 1
@@ -4059,7 +3973,7 @@ clam_set_timer(){
     daily "Every day at 03:00" \
     weekly "Every Sunday at 03:00") || return
   [[ "$freq" == "daily" ]] && oncal="*-*-* 03:00:00" || oncal="Sun *-*-* 03:00:00"
-  self="$(install_self)"
+  self="$(install_self)" || self="$0"
   cat >"/etc/systemd/system/intelshield-clamscan-${kind}.service" <<EOF
 [Unit]
 Description=IntelShield ClamAV ${kind} scan
@@ -4272,7 +4186,7 @@ update_offer_reboot(){
 }
 
 # refresh package index only
-update_refresh(){ infobox "Package Index" "Refreshing repositories (apt-get update)..."; run apt-get update; msg "Package Index" "Repository metadata refreshed."; }
+update_refresh(){ infobox "Package Index" "Refreshing repositories (apt-get update)..."; apt_do update; msg "Package Index" "Repository metadata refreshed."; }
 
 # $1 = safe (apt upgrade, no removals)  |  full (apt full-upgrade, allows dep changes)
 # NEVER performs a release upgrade (do-release-upgrade is never invoked).
@@ -4281,12 +4195,13 @@ update_packages(){
   if [[ "$mode" == full ]]; then cmd=(apt-get -y -o Dpkg::Options::=--force-confold full-upgrade)
   else cmd=(apt-get -y --with-new-pkgs -o Dpkg::Options::=--force-confold upgrade); fi
   infobox "Package Upgrade" "Running $([[ "$mode" == full ]] && echo 'full-upgrade (with dependency changes)' || echo 'safe upgrade (no package removals)').\nThis is NOT a release upgrade — your Ubuntu version stays the same.\n\nWorking..."
-  run apt-get update
+  local relock=0; ensure_unlocked_for_apt && relock=1
+  apt_do update
   out="$IS_TMP/upgrade.out"
-  # stream the upgrade live (when the live console is on) AND capture it for the summary
   DEBIAN_FRONTEND=noninteractive run_capture "$out" "${cmd[@]}"; local rc=$?
   cat "$out" >>"$LOG"
-  run apt-get -y autoremove
+  apt_do -y autoremove
+  (( relock )) && system_lock
   { echo "Package upgrade ($mode) — $(date '+%F %T')"; echo "exit: $rc"; echo;
     echo "== upgraded / changed =="; grep -Ei 'Setting up|Unpacking|Removing|newly installed|upgraded,' "$out" | tail -n 60 || true;
     echo; echo "== reboot required =="; reboot_required && cat /var/run/reboot-required 2>/dev/null || echo "no"; } >"$IS_TMP/upgrade.view"
@@ -4297,7 +4212,7 @@ update_packages(){
 
 update_firmware(){
   local virt; virt=$(systemd-detect-virt 2>/dev/null || echo none)
-  have fwupdmgr || { infobox "Firmware" "Installing fwupd (firmware update daemon)..."; run apt-get install -y fwupd; }
+  have fwupdmgr || { infobox "Firmware" "Installing fwupd (firmware update daemon)..."; apt_do install -y fwupd; }
   have fwupdmgr || { msg "Firmware" "fwupd is not available on this host."; return 1; }
   if [[ "$virt" != none && "$virt" != "bare-metal" ]]; then
     yesno "Firmware Update" "This host is virtualized ($virt); fwupd usually finds no updatable devices on a VM/VPS.\n\nRun the firmware check anyway?" || return 3
@@ -4317,13 +4232,13 @@ update_firmware(){
 }
 
 update_drivers(){
-  have ubuntu-drivers || { infobox "Drivers" "Installing ubuntu-drivers-common..."; run apt-get install -y ubuntu-drivers-common; }
+  have ubuntu-drivers || { infobox "Drivers" "Installing ubuntu-drivers-common..."; apt_do install -y ubuntu-drivers-common; }
   { echo "== detected devices / recommended drivers =="; ubuntu-drivers devices 2>&1 || echo "(ubuntu-drivers unavailable or no devices)"; } >"$IS_TMP/drv.view"
   showfile "Driver Detection" "$IS_TMP/drv.view"
   yesno "Driver Update" "Install the recommended hardware drivers (ubuntu-drivers autoinstall) and refresh the linux-firmware blobs?\n\nOn a plain VPS this is usually a no-op; on bare metal it may pull GPU/NIC drivers." || return 3
   infobox "Drivers" "Installing recommended drivers and refreshing linux-firmware..."
   run ubuntu-drivers autoinstall
-  run apt-get install -y --only-upgrade linux-firmware
+  apt_do install -y --only-upgrade linux-firmware
   msg "Drivers" "Driver install/refresh finished. See $LOG for details."
   state_write
   update_offer_reboot
@@ -4340,7 +4255,7 @@ update_auto_status(){
 
 update_auto_enable(){
   infobox "Auto-Update" "Configuring unattended security updates with an automatic ${AUTO_REBOOT_TIME} reboot when required..."
-  run apt-get install -y unattended-upgrades
+  apt_do install -y unattended-upgrades
   local include_kernel=no
   if yesno_danger "Include Kernel & Firmware?" "Also auto-install KERNEL and driver/firmware updates?\n\nYes = fully patched, but the ${AUTO_REBOOT_TIME} reboot may bounce the kernel and briefly drop the VLESS tunnel.\nNo  = recommended for relays: auto-patch everything EXCEPT the kernel/engines (still reboots at ${AUTO_REBOOT_TIME} for other updates that need it)."; then
     include_kernel=yes
@@ -4475,10 +4390,12 @@ EOF
 maint_os_update(){
   local rc=0
   maint_log "=== OS package maintenance started (IntelShield v$VERSION) ==="
-  maint_step os-apt-update apt-get -o "$APT_LOCK_OPT" update || rc=1
-  maint_step os-apt-upgrade apt-get -o "$APT_LOCK_OPT" -y --with-new-pkgs \
+  local relock=0; ensure_unlocked_for_apt && relock=1
+  maint_step os-apt-update apt_do update || rc=1
+  maint_step os-apt-upgrade apt_do -y --with-new-pkgs \
              -o Dpkg::Options::=--force-confold upgrade || rc=1
-  maint_step os-autoremove apt-get -o "$APT_LOCK_OPT" -y autoremove || true
+  maint_step os-autoremove apt_do -y autoremove || true
+  (( relock )) && system_lock
   if [[ -f /var/run/reboot-required ]]; then
     local pkgs=""; [[ -f /var/run/reboot-required.pkgs ]] && pkgs=" (pkgs: $(tr '\n' ' ' </var/run/reboot-required.pkgs))"
     maint_log "NOTICE: reboot required${pkgs} — handled by the ${AUTO_REBOOT_TIME} auto-reboot policy if enabled (Update Center)"
@@ -4521,7 +4438,7 @@ maint_components(){
   if wazuh_agent_present; then
     local wv_before wv_after
     wv_before="$(dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null)"
-    if maint_step wazuh-agent-upgrade apt-get -o "$APT_LOCK_OPT" install -y --only-upgrade wazuh-agent; then
+    if maint_step wazuh-agent-upgrade apt_do install -y --only-upgrade wazuh-agent; then
       wv_after="$(dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null)"
       if [[ -n "$wv_after" && "$wv_after" != "$wv_before" ]]; then
         maint_log "[wazuh-agent] upgraded ${wv_before:-?} -> ${wv_after}"
@@ -4577,10 +4494,13 @@ self_update_check(){
     return 0
   fi
   staged="${dst}.staged.$$"
-  install -m 750 "$tmp" "$staged" 2>>"$MAINT_LOG" || { maint_log "ALERT: [self-update] staging to $staged failed"; rm -f "$staged"; return 1; }
+  # C2-1 fix: /usr may be immutable — unlock before writing the self-update
+  local relock=0; ensure_unlocked_for_apt && relock=1
+  install -m 750 "$tmp" "$staged" 2>>"$MAINT_LOG" || { maint_log "ALERT: [self-update] staging to $staged failed"; rm -f "$staged"; (( relock )) && system_lock; return 1; }
   if ! mv -f "$staged" "$dst" 2>>"$MAINT_LOG"; then
-    maint_log "ALERT: [self-update] atomic install to $dst failed"; rm -f "$staged"; return 1
+    maint_log "ALERT: [self-update] atomic install to $dst failed"; rm -f "$staged"; (( relock )) && system_lock; return 1
   fi
+  (( relock )) && system_lock
   maint_log "[self-update] installed v$remote_ver over v$VERSION at $dst"
   log "self-update: v$remote_ver installed at $dst (was v$VERSION)"
   if [[ "$mode" == interactive ]]; then
@@ -4615,7 +4535,7 @@ maint_run(){
 # ---- cron lifecycle (OPT-IN: written only from the menu) ----------------------
 maint_cron_status(){ [[ -f "$MAINT_CRON" ]] && printf 'ENABLED' || printf 'disabled'; }
 maint_cron_enable(){
-  local self; self="$(install_self)"
+  local self; self="$(install_self)" || self="$0"
   maint_write_logrotate
   cat >"$MAINT_CRON" <<EOF
 # IntelShield Maintenance & Auto-Update Engine (managed — regenerated by the menu).
@@ -4703,13 +4623,8 @@ case "${1:-}" in
       *) echo "usage: $0 --suricata-ips on|off  (use with --non-interactive --yes for automation)" >&2; exit 2 ;;
     esac; exit $? ;;
   --suricata-fw)
-    preflight
-    case "${2:-}" in
-      on|enable)  suricata_fw_enable ;;
-      off|disable) suricata_fw_disable ;;
-      status)      suricata_fw_status ;;
-      *) echo "usage: $0 --suricata-fw on|off|status  (Suricata 8 Firewall Mode, requires Suricata 8+)" >&2; exit 2 ;;
-    esac; exit $? ;;
+    echo "ERROR: Suricata 8 Firewall Mode is disabled in v9.8 — experimental feature removed pending rewrite." >&2
+    exit 1 ;;
   --lock)
     preflight
     system_lock && echo "System LOCKED. Immutable count: $(count_immutable)" || { echo "Lock failed." >&2; exit 1; }
@@ -4759,12 +4674,15 @@ esac
 _menu_toggle_immutability(){
   local current
   current="$(get_lock_status)"
-  msg "Immutability Status" "Current state: ${current}\n\nLocked paths: /bin, /sbin, /usr, /boot, /etc/passwd, /etc/shadow, etc.\nExcluded: /var/log, /tmp, /proc, /sys, /dev, /run"
-  if [[ "$current" == "LOCKED" ]]; then
+  local actual; actual="$(count_immutable)"
+  # Verify reality, not just the state file — handle crash-mid-lock (LOCKING) and state file drift
+  if (( actual > 0 )) || [[ "$current" == "LOCKED" || "$current" == "LOCKING" ]]; then
+    msg "Immutability Status" "Current state: ${current} (actual immutable count: ${actual})"
     yesno "Unlock System" "Remove immutable flags from system directories?\nThis is required before running apt-get or system updates." && {
-      system_unlock && msg "Unlocked" "System UNLOCKED. Mutable paths: $(count_immutable) files remaining immutable."
+      system_unlock && msg "Unlocked" "System UNLOCKED. Immutable count: $(count_immutable)"
     }
   else
+    msg "Immutability Status" "Current state: ${current} (actual immutable count: ${actual})"
     yesno "Lock System" "Apply immutable flags to critical system paths?\n/bin, /sbin, /usr, /boot, /etc/passwd etc. will become read-only.\nYou will need to UNLOCK before apt-get or system updates." && {
       system_lock && msg "Locked" "System LOCKED. Immutable count: $(count_immutable) files/dirs"
     }
@@ -4806,8 +4724,7 @@ I  "System immutability control [$(get_lock_status)]" \
 F  "Firewall & IPS sync (nftables pipeline)" \
 L  "Live console output: ${_LIVE_LBL}  (watch commands run in real time)" \
 18 "Uninstall / revert safely" \
-19 "Exit" 3>&1 1>&2 2>&3)
-  case "$?" in 1|255) break ;; esac
+19 "Exit" 3>&1 1>&2 2>&3) || break
   [[ -n "$CH" ]] && MENU_LAST[__main__]="$CH"
   case "$CH" in
     1)  guided ;;
