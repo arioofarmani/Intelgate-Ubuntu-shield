@@ -1,10 +1,10 @@
-# IntelShield v8.3
+# IntelShield v8.6
 
 **Unified hardening, forensics, SIEM/XDR, and performance tuning for Ubuntu servers -- in a single Bash script with a full text UI.**
 
 IntelShield is a menu-driven security suite for **Ubuntu 22.04 / 24.04 LTS** servers, with first-class support for **x-ui / 3x-ui + Xray (VLESS-Reality)** relays. It installs, configures, wires together, and manages a complete defensive stack -- firewall, IDS/IPS, intrusion prevention, antivirus, file-integrity, rootkit detection, audit, and a Wazuh agent -- behind one consistent `whiptail` interface, with safety rails designed so you can harden a **remote** box without locking yourself out.
 
-**New in v8.3:** Suricata 8 **Firewall Mode** with deterministic packet pipeline and default-drop policy, **nftables priority chain orchestration** for CrowdSec/Suricata coexistence, **transactional rule management** CLI (enable/disable/drop.conf), support for Suricata 8's 107+ new keywords (`entropy`, `luaxform`, `absent`), JSON dataset IoC context parsing, CPU affinity auto-configuration, and exception-policy statistics.
+**New in v8.6:** Full **dual-stack IPv6 support** (validation, HOME_NET, egress detection), **transactional rule hardening** with 5-gate atomic execution and deterministic snapshot/validate/apply/verify/rollback gates, plus all v8.3 features: Suricata 8 **Firewall Mode** (deterministic packet pipeline, default-drop), **nftables priority chain orchestration** (CrowdSec @priority 0, Suricata @priority 10), **mutex toggle** for concurrent IPS conflict prevention, and Suricata 8's 107+ new keywords (`entropy`, `luaxform`, `absent`, JSON datasets).
 
 > **Use only on servers you own or are authorized to administer.** IntelShield makes real changes to firewall rules, SSH, kernel parameters, and system services. Always test on a throwaway VM first and keep console/out-of-band access available.
 
@@ -512,6 +512,9 @@ An experimental mode that replaces traditional IDS/IPS with a deterministic pack
 **How does CrowdSec coexist with Suricata Firewall Mode?**
 Via nftables priority chain orchestration: CrowdSec evaluates at priority 0 (edge, IP reputation), survivors pass to Suricata at priority 10 (deep inspection). A mutex toggle prevents conflicts.
 
+**Does IntelShield support IPv6?**
+Yes. v8.6 adds full dual-stack support: `valid_ip()` validates IPv4, IPv6 (compressed/full/mixed), and CIDR notation (0-32 for v4, 0-128 for v6). HOME_NET auto-detects IPv6 egress and includes `::1/128` and `fd00::/8` ULA ranges. The allowlist injects IPv6 records into CrowdSec without breaking YAML parsers.
+
 **Can I run just one component?**
 Yes -- use **Select individual modules (2)** or the **Component control center (17)**.
 
@@ -543,4 +546,4 @@ Released under the **MIT License** -- see [`LICENSE`](LICENSE). If no license fi
 
 ---
 
-<p align="center"><em>IntelShield v8.3 -- harden fast, break nothing, revert anytime.</em></p>
+<p align="center"><em>IntelShield v8.6 -- harden fast, break nothing, revert anytime.</em></p>

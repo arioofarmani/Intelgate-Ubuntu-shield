@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #==============================================================================
-#  IntelShield v7.0  —  Unified Hardening · Forensics · SIEM/XDR · Performance
+#  IntelShield v8.6  —  Unified Hardening · Forensics · SIEM/XDR · Performance
 #  Target : Ubuntu 22.04 / 24.04 LTS server + x-ui/3x-ui + Xray VLESS-Reality
 #  Lineage: intelshield v2.5 (rich UI base) + IntelShield-AllInOne v1.3.1 (extras)
 #           v3.0 adds Suricata inline IPS (+ CrowdSec coexistence), rule selection,
@@ -52,11 +52,21 @@
 #               drop.conf with atomic validation gates.
 #             • CPU affinity auto-configuration, granular exception-policy
 #               statistics, and self-healing rule compilation rollback.
+#           v8.6 — Dual-stack IPv6 + transactional rule hardening:
+#             • valid_ip() rewritten for full dual-stack: IPv4, IPv6
+#               (compressed/full/mixed), zone IDs, CIDR (0-32 v4, 0-128 v6).
+#             • PUB_IP detection includes IPv6 egress fallback.
+#             • HOME_NET auto-detects IPv6 egress and generates bracket-
+#               notation with ::1/128 and fd00::/8 ULA ranges.
+#             • suricata_rule_state_toggle() upgraded to 5-gate atomic
+#               execution: validate, backup, atomic write, verify, cleanup.
+#             • suricata_apply_transactional_rules() implements deterministic
+#               snapshot -> validate -> apply -> verify -> restart-or-rollback.
 #==============================================================================
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-APP="IntelShield"; VERSION="8.3"
+APP="IntelShield"; VERSION="8.6"
 LOG="/var/log/intelshield.log"
 BT="IntelShield v${VERSION} | Hardening · Forensics · SIEM/XDR · Performance"
 
