@@ -30,11 +30,12 @@
 #             • Ubuntu 24.04 (noble) install fixes: PPA availability is verified
 #               before trusting it, and the libhtp1→libhtp2 upgrade conflict is
 #               auto-remediated.
-#             • NEW Maintenance & Auto-Update Engine (opt-in, cron-based):
+#             • NEW Maintenance Engine (opt-in, cron-based):
 #               unattended OS upgrades, sequential component updates (Suricata
-#               rules / CrowdSec hub / ClamAV sigs / Wazuh agent), secure script
-#               self-update from GitHub, service restarts ONLY on verified update
-#               success, everything audited in /var/log/intelshield-maintenance.log.
+#               rules / CrowdSec hub / ClamAV sigs / Wazuh agent), service
+#               restarts ONLY on verified update success, everything audited in
+#               /var/log/intelshield-maintenance.log. (Script self-update was
+#               removed in v9.9.1 — it installed unsigned code as root.)
 #           v8.3 — Suricata 8 Firewall Mode + nftables Orchestration overhaul:
 #             • Experimental Firewall Mode: deterministic packet pipeline with
 #               default-drop policy, explicit action scopes (accept:packet,
@@ -75,7 +76,7 @@
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-APP="IntelShield"; VERSION="9.9"
+APP="IntelShield"; VERSION="9.9.1"
 LOG="/var/log/intelshield.log"
 BT="IntelShield v${VERSION} | Hardening · Forensics · SIEM/XDR · Performance"
 
@@ -152,8 +153,7 @@ MAINT_LOCK="/run/intelshield-maintenance.lock"         # flock guard: one run at
 GLOBAL_LOCK="/run/intelshield-global.lock"             # H2-15: global entry-point flock
 SURI_RULES_LOCK="/run/intelshield-suricata-rules.lock" # H2-16: suricata rule update flock
 MAINT_LOGROTATE="/etc/logrotate.d/intelshield-maintenance"
-UPDATE_CONF="/etc/intelshield/update.conf"             # optional UPDATE_URL= override
-UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/arioofarmani/Intelgate-Ubuntu-shield/main/IntelShield.sh"
+UPDATE_CONF="/etc/intelshield/update.conf"             # legacy; only ever removed now (H2-7)
 # apt calls made from cron wait for a busy dpkg lock instead of failing instantly
 # (used as: apt-get -o "$APT_LOCK_OPT" ...)
 APT_LOCK_OPT="DPkg::Lock::Timeout=600"
@@ -228,13 +228,14 @@ IntelShield v${VERSION} — headless controller flags:
                                                release/distro upgrade)
   --auto-update on|off                         Enable/disable automatic updates + auto-reboot
                                                at 01:11 when a reboot is required
-  --maintain os|components|self|all            Maintenance engine (used by the cron jobs):
+  --maintain os|components|all                 Maintenance engine (used by the cron jobs):
                                                os = apt update+safe upgrade, components =
                                                Suricata rules / CrowdSec hub / ClamAV sigs /
-                                               Wazuh agent, self = script self-update.
+                                               Wazuh agent.
                                                Logs to /var/log/intelshield-maintenance.log
-  --self-update                                Check the GitHub repo for a newer IntelShield,
-                                               verify it and install it atomically
+  --self-update                                DISABLED (v9.9.1): updates were unsigned, so
+                                               this installed unverified code as root. Update
+                                               IntelShield by hand after reviewing the release.
   --wazuh-menu                                 Open the Wazuh agent integration menu
   --uninstall                                  Open the uninstall / revert menu
   --yes, -y                                    Assume "yes" for confirmations (headless)
@@ -4194,8 +4195,10 @@ update_refresh(){ infobox "Package Index" "Refreshing repositories (apt-get upda
 # NEVER performs a release upgrade (do-release-upgrade is never invoked).
 update_packages(){
   local mode="${1:-safe}" out; local -a cmd
-  if [[ "$mode" == full ]]; then cmd=(apt-get -y -o Dpkg::Options::=--force-confold full-upgrade)
-  else cmd=(apt-get -y --with-new-pkgs -o Dpkg::Options::=--force-confold upgrade); fi
+  # This is the one apt write that cannot go through apt_do (it needs run_capture to
+  # tee the transcript into the result view), so it must carry APT_LOCK_OPT by hand.
+  if [[ "$mode" == full ]]; then cmd=(apt-get -y -o "$APT_LOCK_OPT" -o Dpkg::Options::=--force-confold full-upgrade)
+  else cmd=(apt-get -y -o "$APT_LOCK_OPT" --with-new-pkgs -o Dpkg::Options::=--force-confold upgrade); fi
   infobox "Package Upgrade" "Running $([[ "$mode" == full ]] && echo 'full-upgrade (with dependency changes)' || echo 'safe upgrade (no package removals)').\nThis is NOT a release upgrade — your Ubuntu version stays the same.\n\nWorking..."
   local relock=0; ensure_unlocked_for_apt && relock=1
   apt_do update
@@ -4454,66 +4457,37 @@ maint_components(){
   return $overall
 }
 
-# ---- phase 3: script self-update (verified, atomic, hot-reload optional) ------
-update_url_get(){
-  local url=""
-  # sed (not awk -F=) so URLs containing '=' (query strings, tokens) survive intact
-  [[ -f "$UPDATE_CONF" ]] && url="$(sed -n 's/^UPDATE_URL=//p' "$UPDATE_CONF" 2>/dev/null | tail -1 | tr -d '"' | tr -d "'")"
-  [[ -z "$url" ]] && url="$UPDATE_URL_DEFAULT"
-  printf '%s' "$url"
-}
-update_url_set(){ mkdir -p "$(dirname "$UPDATE_CONF")"; printf 'UPDATE_URL=%s\n' "$1" >"$UPDATE_CONF"; chmod 600 "$UPDATE_CONF"; }
+# ---- phase 3: script self-update — REMOVED in v9.9.1, see self_update_check ---
+# update_url_get/update_url_set went with it: there is nothing left to point at
+# an update source. $UPDATE_CONF is still cleaned up by uninstall/backup so a
+# file left behind by an older version doesn't linger.
 
 # $1 = cron | interactive.
-# Security model: HTTPS-only fetch (TLS >= 1.2, no protocol downgrade), identity
-# marker + VERSION header required, full `bash -n` syntax validation — and the
-# candidate is NEVER executed during verification. Install is stage + rename
-# (atomic): running sessions keep their already-open file descriptor, so a live
-# interactive session is never corrupted mid-run.
+#
+# DISABLED IN v9.9.1 (audit finding H2-7). This function used to fetch the script
+# over HTTPS, "verify" it with four checks — non-empty, the string "IntelShield"
+# in the first 5 lines, a VERSION= marker, and `bash -n` — then install it to
+# /usr/local/sbin/intelshield and run it as root from the weekly cron.
+#
+# Every one of those four checks is trivially satisfied by any file an attacker
+# controls. None of them prove AUTHENTICITY: TLS proves you reached the server,
+# not that the server is honest, and `bash -n` proves the payload parses, not
+# that it is ours. Anyone who could push to the update repo, take over the
+# account, or present a valid cert for the host had unattended root code
+# execution on every deployed box, weekly, by design.
+#
+# There is no safe way to keep this without a signature. Re-enabling it requires
+# a GPG detached signature verified against a public key pinned in this script:
+# fetch IntelShield.sh + IntelShield.sh.asc, `gpg --verify` against the pinned
+# key in an ephemeral keyring, and refuse to install on any failure. Until that
+# exists, updating is a deliberate operator action — see the message below.
 self_update_check(){
-  local mode="${1:-interactive}" url tmp remote_ver dst=/usr/local/sbin/intelshield staged
-  url="$(update_url_get)"
-  tmp="$IS_TMP/intelshield.remote"
-  maint_log "[self-update] checking $url (local v$VERSION)"
-  if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 "$url" -o "$tmp" 2>>"$MAINT_LOG"; then
-    maint_log "ALERT: [self-update] download failed (URL unreachable or file missing)"
-    [[ "$mode" == interactive ]] && msg "Self-Update" "Could not fetch the update source:\n$url\n\nPublish the script there (or fix the URL from this menu). See $MAINT_LOG."
-    return 1
-  fi
-  [[ -s "$tmp" ]] || { maint_log "ALERT: [self-update] downloaded file is empty"; return 1; }
-  head -n 5 "$tmp" | grep -q "IntelShield" || { maint_log "ALERT: [self-update] identity check failed (no IntelShield header) — NOT installed"; return 1; }
-  remote_ver="$(grep -m1 -E 'VERSION="[0-9][^"]*"' "$tmp" | sed -E 's/.*VERSION="([^"]+)".*/\1/')"
-  [[ -n "$remote_ver" ]] || { maint_log "ALERT: [self-update] no VERSION marker in remote file — NOT installed"; return 1; }
-  if ! bash -n "$tmp" 2>>"$MAINT_LOG"; then
-    maint_log "ALERT: [self-update] remote script failed bash -n syntax validation — NOT installed"
-    [[ "$mode" == interactive ]] && msg "Self-Update" "The remote script failed syntax validation and was NOT installed. See $MAINT_LOG."
-    return 1
-  fi
-  # newest-wins compare (sort -V handles 8.0 vs 8.0.1 vs 10.0 correctly)
-  if [[ "$remote_ver" == "$VERSION" || "$(printf '%s\n%s\n' "$VERSION" "$remote_ver" | sort -V | tail -1)" == "$VERSION" ]]; then
-    maint_log "[self-update] already current (local v$VERSION >= remote v$remote_ver)"
-    [[ "$mode" == interactive ]] && msg "Self-Update" "IntelShield is up to date.\n\nLocal:  v$VERSION\nRemote: v$remote_ver\nSource: $url"
-    return 0
-  fi
-  staged="${dst}.staged.$$"
-  # C2-1 fix: /usr may be immutable — unlock before writing the self-update
-  local relock=0; ensure_unlocked_for_apt && relock=1
-  install -m 750 "$tmp" "$staged" 2>>"$MAINT_LOG" || { maint_log "ALERT: [self-update] staging to $staged failed"; rm -f "$staged"; (( relock )) && system_lock; return 1; }
-  if ! mv -f "$staged" "$dst" 2>>"$MAINT_LOG"; then
-    maint_log "ALERT: [self-update] atomic install to $dst failed"; rm -f "$staged"; (( relock )) && system_lock; return 1
-  fi
-  (( relock )) && system_lock
-  maint_log "[self-update] installed v$remote_ver over v$VERSION at $dst"
-  log "self-update: v$remote_ver installed at $dst (was v$VERSION)"
+  local mode="${1:-interactive}"
+  maint_log "[self-update] DISABLED (H2-7): no signature verification — refusing to fetch or install"
   if [[ "$mode" == interactive ]]; then
-    if yesno "IntelShield Updated" "Version $remote_ver has been installed (you were on $VERSION).\n\nHot-reload into the new version now?\n\n(The new version starts fresh at its main menu; the timers/cron already point at the updated canonical copy.)"; then
-      log "self-update: hot-reloading into v$remote_ver"
-      clear 2>/dev/null || true
-      exec bash "$dst"
-    fi
-    msg "Self-Update" "v$remote_ver is installed at $dst.\nThis session keeps running v$VERSION until you exit; every timer and cron job already uses the new version."
+    msg "Self-Update Disabled" "Automatic self-update is DISABLED in this build.\n\nIt could not authenticate what it downloaded — only that the download parsed as bash. That made every host updatable by anyone who could write to the update source, unattended, as root.\n\nTo update IntelShield, do it deliberately:\n\n  1. Review the new release yourself.\n  2. install -m 750 IntelShield.sh /usr/local/sbin/intelshield\n\nRe-enabling automatic updates requires GPG-signed releases verified against a pinned key." 20 96
   fi
-  return 0
+  return 1
 }
 
 # ---- single-flight runner (used by the dispatcher and the run-now menu) -------
@@ -4527,8 +4501,10 @@ maint_run(){
     case "$what" in
       os)         maint_os_update ;;
       components) maint_components ;;
+      # H2-7: 'self' is retained so existing cron files that still reference it
+      # degrade to a logged no-op instead of a hard usage error.
       self)       self_update_check cron ;;
-      all)        rc=0; maint_os_update || rc=1; maint_components || rc=1; self_update_check cron || rc=1; exit "$rc" ;;
+      all)        rc=0; maint_os_update || rc=1; maint_components || rc=1; exit "$rc" ;;
       *)          echo "usage: $0 --maintain os|components|self|all" >&2; exit 2 ;;
     esac
   ) 9>"$MAINT_LOCK"
@@ -4548,8 +4524,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 15 2 * * * root $self --maintain os --non-interactive --yes >>$MAINT_LOG 2>&1
 # Security components: Suricata rules · CrowdSec hub · ClamAV sigs · Wazuh agent
 15 3 * * * root $self --maintain components --non-interactive --yes >>$MAINT_LOG 2>&1
-# IntelShield self-update (verified + atomic; weekly, Sunday)
-30 4 * * 0 root $self --maintain self --non-interactive --yes >>$MAINT_LOG 2>&1
+# NOTE: the weekly self-update job was REMOVED in v9.9.1 (audit finding H2-7).
+# It installed and ran unsigned code as root. Update IntelShield deliberately.
 EOF
   chmod 644 "$MAINT_CRON"
   maint_log "maintenance cron ENABLED -> $MAINT_CRON (canonical script: $self)"
@@ -4558,20 +4534,19 @@ EOF
 maint_cron_disable(){ rm -f "$MAINT_CRON"; maint_log "maintenance cron DISABLED (cron file removed)"; state_write; }
 
 maintenance_menu(){
-  local c st url
+  local c st
   while :; do
-    st="$(maint_cron_status)"; url="$(update_url_get)"
-    c=$(menu "🛠 Maintenance & Auto-Update Engine" "Scheduled cron: ${st}   |   Audit log: ${MAINT_LOG}\nUpdate source: ${url}" \
-      E "Enable schedule  (OS daily 02:15 · components daily 03:15 · self-update Sun 04:30)" \
+    st="$(maint_cron_status)"
+    c=$(menu "🛠 Maintenance Engine" "Scheduled cron: ${st}   |   Audit log: ${MAINT_LOG}\nSelf-update: DISABLED (unsigned — see Maintenance log)" \
+      E "Enable schedule  (OS daily 02:15 · components daily 03:15)" \
       X "Disable schedule (remove the cron file)" \
       O "Run OS package maintenance NOW" \
       C "Run component updates NOW  (Suricata rules / CrowdSec hub / ClamAV / Wazuh)" \
-      U "Check for an IntelShield update NOW" \
-      S "Set the self-update source URL" \
+      U "How to update IntelShield itself" \
       V "View the maintenance audit log" \
       b "Back") || return
     case "$c" in
-      E) yesno "Enable Scheduled Maintenance" "Write $MAINT_CRON with these jobs?\n\n  02:15 daily — OS: apt update + safe upgrade (no removals)\n  03:15 daily — components: Suricata rules, CrowdSec hub, ClamAV sigs, Wazuh agent\n  04:30 Sun   — IntelShield self-update (verified, atomic)\n\nServices restart ONLY after a verified successful update; every action is logged to $MAINT_LOG." 20 96 \
+      E) yesno "Enable Scheduled Maintenance" "Write $MAINT_CRON with these jobs?\n\n  02:15 daily — OS: apt update + safe upgrade (no removals)\n  03:15 daily — components: Suricata rules, CrowdSec hub, ClamAV sigs, Wazuh agent\n\nIntelShield does NOT update itself: that path installed unsigned code as root and was removed.\n\nServices restart ONLY after a verified successful update; every action is logged to $MAINT_LOG." 20 96 \
            && { maint_cron_enable; msg "Maintenance Enabled" "Scheduled maintenance is ON.\n\nCron file: $MAINT_CRON\nAudit log: $MAINT_LOG\n\nA reboot needed by an OS update is NOT taken automatically — pair with the Update Center's ${AUTO_REBOOT_TIME} auto-reboot policy if you want that."; } ;;
       X) maint_cron_disable; msg "Maintenance Disabled" "The scheduled cron jobs were removed.\nManual 'run NOW' actions in this menu still work." ;;
       O) infobox "OS Maintenance" "Running apt update + safe upgrade now — output streams to the terminal (live console) and to $MAINT_LOG..."
@@ -4581,10 +4556,6 @@ maintenance_menu(){
          if maint_run components; then msg "Component Updates" "All applicable components updated cleanly (services restarted only where an update succeeded).\nDetails: $MAINT_LOG"
          else msg "Component Updates" "Component maintenance finished WITH ERRORS — the failing step was rolled back / left untouched. Review $MAINT_LOG."; fi ;;
       U) self_update_check interactive ;;
-      S) local newurl; newurl=$(input "Update Source" "HTTPS URL of the raw IntelShield script to self-update from:\n(published copy of this script, stable filename)" "$url") || continue
-         [[ -z "$newurl" ]] && continue
-         [[ "$newurl" == https://* ]] || { msg "Update Source" "Only https:// sources are accepted."; continue; }
-         update_url_set "$newurl"; msg "Update Source" "Self-update source saved:\n$newurl\n\nStored in $UPDATE_CONF." ;;
       V) tail -n 400 "$MAINT_LOG" >"$IS_TMP/maintlog" 2>/dev/null || echo "(maintenance log empty)" >"$IS_TMP/maintlog"
          showfile "Maintenance Audit Log (last 400 lines)" "$IS_TMP/maintlog" 34 120 ;;
       b) return ;;
@@ -4721,7 +4692,7 @@ while :; do
 16 "View IntelShield log" \
 17 "Component control center (enable/disable modules)" \
 U  "Update center (system / firmware / drivers / auto-update)" \
-M  "Maintenance engine (scheduled updates + self-update): $(maint_cron_status)" \
+M  "Maintenance engine (scheduled OS + component updates): $(maint_cron_status)" \
 I  "System immutability control [$(get_lock_status)]" \
 F  "Firewall & IPS sync (nftables pipeline)" \
 L  "Live console output: ${_LIVE_LBL}  (watch commands run in real time)" \

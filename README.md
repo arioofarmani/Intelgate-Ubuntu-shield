@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-9.9-blue?style=for-the-badge" alt="Version">
+  <img src="https://img.shields.io/badge/version-9.9.1-blue?style=for-the-badge" alt="Version">
   <img src="https://img.shields.io/badge/platform-Ubuntu%2022.04%20%7C%2024.04-brightgreen?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="License">
   <img src="https://img.shields.io/badge/audit-Round%202%20resolved-red?style=for-the-badge" alt="Audit">
 </p>
 
-<h1 align="center">IntelShield v9.9</h1>
+<h1 align="center">IntelShield v9.9.1</h1>
 
 <p align="center">
   <b>Unified Server Hardening · Forensics · SIEM/XDR · Performance · Immutability</b><br>
@@ -38,7 +38,7 @@ sudo ./IntelShield.sh
 ## Architecture
 
 ```
-                    IntelShield v9.9
+                    IntelShield v9.9.1
   ┌──────────┬──────────┬──────────┬──────────┬──────────┐
   │  Kernel  │ Network  │ Service  │ Forensic │Maintenan.│
   │ Hardening│ Firewall │Enforcem. │  Engine  │  Engine  │
@@ -59,16 +59,33 @@ sudo ./IntelShield.sh
 
 ---
 
-## What v9.9 Fixes
+## What v9.9.1 Fixes
 
-All **30 findings** from the Round 2 security audit resolved:
+**Self-update is removed.** Through v9.9 the script fetched a new copy of itself over
+HTTPS and "verified" it by checking that the file was non-empty, contained the string
+`IntelShield` in its first five lines, carried a `VERSION=` marker, and parsed under
+`bash -n` — then installed it and ran it as root from a weekly cron. None of those
+checks prove authenticity: TLS proves you reached the server, not that the server is
+honest, and `bash -n` proves the payload parses, not that it is ours. Anyone able to
+write to the update source had unattended weekly root code execution on every host.
+There is no safe version of this without a signature, so it is gone — update by hand
+after reviewing a release. (Audit finding H2-7.)
+
+Also fixed: the package-upgrade path was the one apt call that bypassed `apt_do()`, so
+it ran without a dpkg lock timeout and would fail instantly against a busy dpkg lock.
+
+v9.9 resolved the rest of the Round 2 audit:
 
 | Severity | Count | Key Fixes |
 |----------|-------|-----------|
-| **Critical** | 2 | `apt_do()` wrapper for all apt operations; self-update unlock |
-| **High** | 7 | SSH socket-activation; ClamAV RAM gate; global flock; IPS conntrack |
+| **Critical** | 2 | `apt_do()` — one entry point for every apt write: unlock → lock-timeout → re-lock |
+| **High** | 7 | SSH socket-activation; ClamAV RAM gate; global flock; IPS conntrack fast-path |
 | **Medium** | 11 | HUP trap; IPv6 validation; log sanitization; atomic state writes |
 | **Low** | 10 | Dead code cleanup; install_self rc propagation |
+
+> Round 1's Critical C-1 ("the `EXTERNAL_NET` heredoc emits invalid YAML") was a **false
+> positive** and is deliberately *not* "fixed" — the heredoc is unquoted, so it emits
+> `EXTERNAL_NET: "!$HOME_NET"`, which is the canonical Suricata syntax.
 
 ---
 
@@ -146,5 +163,5 @@ MIT License
 
 <p align="center">
   <b>Built for production servers that cannot afford to be breached.</b><br>
-  <sub>IntelShield v9.9 — Audit-Hardened · OS-Aware Immutability · Zero-Trust Hardening</sub>
+  <sub>IntelShield v9.9.1 — Audit-Hardened · OS-Aware Immutability · Zero-Trust Hardening</sub>
 </p>
