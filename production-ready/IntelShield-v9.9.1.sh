@@ -76,6 +76,7 @@
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# shellcheck disable=SC2034  # APP is metadata: it names the program alongside VERSION.
 APP="IntelShield"; VERSION="9.9.1"
 LOG="/var/log/intelshield.log"
 BT="IntelShield v${VERSION} | Hardening · Forensics · SIEM/XDR · Performance"
@@ -90,16 +91,22 @@ RISK_JSON="${STATE_DIR}/preflight-risk.json"
 STARTUP_BACKUP_STAMP="${STATE_DIR}/last-startup-backup"
 
 # --- nftables pipeline (v9.5) ------------------------------------------------
-NFT_HOOKS_DIR="/etc/nftables.d"
-NFT_SURICATA_TABLE="inet intelshield_suricata"
-NFT_SURICATA_FW_TABLE="inet intelshield_suricata_fw"
+# The IPS chain hardcodes its own priority (100) in the nft heredoc that builds
+# it; only the pipeline priorities below are passed as variables.
 CROWDSEC_PRIORITY=0
 SURICATA_FW_PRIORITY=10
-SURICATA_IPS_PRIORITY=100
 
 # --- immutability engine (v9.5) ----------------------------------------------
 IMMUTABLE_PATHS=("/bin" "/sbin" "/usr" "/boot")
 IMMUTABLE_FILES=("/etc/passwd" "/etc/shadow" "/etc/fstab" "/etc/group" "/etc/gshadow" "/etc/sudoers")
+# EXCLUDES are find -prune args, so they only bite on subpaths of IMMUTABLE_PATHS.
+# Today that means exactly one entry does anything — /usr/local/sbin — plus the
+# OS-specific /boot/efi and /usr/lib/snapd added by immutable_excludes_for_os().
+# The /var, /tmp, /proc, /etc entries below can never match: find is never sent
+# into those trees. They are kept deliberately as a guard, so that adding /etc or
+# /var to IMMUTABLE_PATHS doesn't silently chattr +i the log dir or resolv.conf.
+# Do NOT read this list as "these paths are protected from locking" — most of
+# them are simply never visited.
 IMMUTABLE_EXCLUDES=("/var/log" "/var/run" "/var/tmp" "/tmp" "/proc" "/sys" "/dev" "/run" "$STATE_DIR" "/etc/resolv.conf" "/etc/hostname" "/usr/local/sbin")
 
 # --- crowdsec / suricata -----------------------------------------------------
@@ -177,7 +184,6 @@ CLAMAV_LOG="/var/log/clamav/custom_suite.log"
 CLAM_QUAR="/var/clamav/quarantine"
 CLAM_MANIFEST="${CLAM_QUAR}/.manifest.tsv"
 CLAMD_CONF="/etc/clamav/clamd.conf"
-FRESHCLAM_CONF="/etc/clamav/freshclam.conf"
 CLAM_MAXSIZE="300M"
 CLAM_EXCLUDE='^/(proc|sys|dev|run|mnt|media|snap|var/lib/clamav|var/clamav/quarantine|var/lib/docker|var/lib/containerd|var/lib/lxcfs)(/|$)'
 CLAM_PROTECT='^/(usr|bin|sbin|lib|lib64|boot|etc|opt/3x-ui|var/lib)(/|$)'
@@ -218,8 +224,6 @@ IntelShield v${VERSION} — headless controller flags:
   --suricata-summary                           Export an eve.json summary
   --suricata-ips on|off                        Switch Suricata to inline IPS / back to IDS
                                                (pair with --non-interactive --yes)
-  --suricata-fw on|off                         Toggle Suricata 8 Firewall Mode (deterministic
-                                               pipeline, default-drop) — requires Suricata 8+
   --lock                                       Apply immutable flags to critical system paths
   --unlock                                     Remove immutable flags from system paths
   --sync-fw                                    Deploy/sync the nftables pipeline
@@ -356,8 +360,6 @@ apt_do(){
   (( relock )) && system_lock
   return $rc
 }
-# Legacy alias — callers that used the old apt_get wrapper now route through apt_do.
-apt_get(){ apt_do "$@"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 have_cs(){ command -v cscli >/dev/null 2>&1; }
 rkhunter_present(){ have rkhunter; }
@@ -867,6 +869,8 @@ valid_ip(){
     expanded="${expanded//::/:__COMPRESSED__:}"
     # Split the expanded string on colons and validate each token
     local IFS=':'
+    # shellcheck disable=SC2086  # the word-split IS the parse: IFS=':' splits the
+    # expanded address into positional params. Quoting $expanded would defeat it.
     set -- $expanded   # word-split on IFS=: into positional params
     for grp in "$@"; do
       [[ -z "$grp" || "$grp" == "__COMPRESSED__" ]] && continue
@@ -1054,8 +1058,33 @@ collect_backup_targets(){
 prune_backups(){
   local keep="${1:-$KEEP_BACKUPS}" old
   ls -1t "$BACKUP_DIR"/config_snapshot_*.tar.gz 2>/dev/null | tail -n +"$((keep+1))" | while read -r old; do
-    rm -f "$old" "${old}.txt"; log "Pruned archaic snapshot: $old"
+    rm -f "$old" "${old}.txt" "${old}.sha256"; log "Pruned archaic snapshot: $old"
   done
+}
+
+# Verify an archive against its .sha256 sidecar.
+#
+# Scope, stated honestly: `tar -tzf` is already a real corruption check. gzip
+# carries a CRC32 over the whole stream and tar reads through it, so random
+# bit-rot DOES fail -tzf (measured: 7/7 single-byte flips caught). The sidecar is
+# not here to catch bit-rot.
+#
+# What -tzf cannot catch is REPLACEMENT: any well-formed tar.gz passes it, so a
+# snapshot silently swapped for a different (or older, or hand-edited) archive
+# lists cleanly and then gets extracted over /. The sha256 pins each archive to
+# the exact bytes written at creation, so a swapped snapshot is caught before it
+# touches the live system.
+#
+# This is integrity, not authenticity: anyone who can rewrite the archive can
+# rewrite the sidecar too. It defends against accident and silent replacement,
+# not against an attacker who already has root here.
+#
+# Returns: 0 verified, 1 MISMATCH (do not restore), 2 no sidecar (archive
+# predates v9.9.1 — unknown, not proven bad).
+verify_backup(){
+  local archive="$1"
+  [[ -f "${archive}.sha256" ]] || return 2
+  ( cd "$(dirname "$archive")" && sha256sum -c --status "$(basename "$archive").sha256" ) 2>/dev/null
 }
 
 do_backup(){
@@ -1073,12 +1102,17 @@ do_backup(){
     printf '  - %s\n' "${TARGETS[@]}"
   } >"${archive}.txt" 2>/dev/null
   if tar -czpf "$archive" "${TARGETS[@]}" >>"$LOG" 2>&1 && tar -tzf "$archive" >/dev/null 2>&1; then
-    chmod 600 "$archive" "${archive}.txt" 2>/dev/null || true  # archives hold host keys + x-ui.db
+    # Pin the archive to the bytes we just wrote, so a later swap is detectable
+    # before we extract it over / — see verify_backup() for what this does and
+    # does not buy.
+    ( cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")" >"$(basename "$archive").sha256" ) 2>/dev/null || \
+      log "WARN: do_backup: could not write sha256 sidecar for $archive"
+    chmod 600 "$archive" "${archive}.txt" "${archive}.sha256" 2>/dev/null || true  # archives hold host keys + x-ui.db
     prune_backups
     echo "$archive"
     return 0
   fi
-  rm -f "$archive" "${archive}.txt" 2>/dev/null
+  rm -f "$archive" "${archive}.txt" "${archive}.sha256" 2>/dev/null
   return 1
 }
 
@@ -1100,7 +1134,13 @@ inspect_snapshot(){
   [[ ${#archives[@]} -eq 0 ]] && { msg "Snapshot Inventory" "No archive configurations found inside workspace target directories."; return; }
   for a in "${archives[@]}"; do args+=("$a" "$(basename "$a")"); done
   chosen=$(menu "Archive Inspection" "Select target snapshot to inspect file properties:" "${args[@]}") || return
-  { echo "=== MANIFEST ==="; cat "${chosen}.txt" 2>/dev/null || echo "(No structural metadata raw text metadata properties)"; echo; echo "=== COMPRESSED INTERNAL ARRAYS ==="; tar -tzf "$chosen" 2>&1; } >"$IS_TMP/inspect"
+  local integrity; verify_backup "$chosen"
+  case $? in
+    0) integrity="VERIFIED — sha256 matches the checksum recorded at creation" ;;
+    1) integrity="*** MISMATCH — not the bytes written at creation; restore will be REFUSED ***" ;;
+    2) integrity="UNVERIFIABLE — no sha256 sidecar (archive predates v9.9.1)" ;;
+  esac
+  { echo "=== MANIFEST ==="; cat "${chosen}.txt" 2>/dev/null || echo "(No structural metadata raw text metadata properties)"; echo; echo "=== INTEGRITY ==="; echo "$integrity"; echo; echo "=== COMPRESSED INTERNAL ARRAYS ==="; tar -tzf "$chosen" 2>&1; } >"$IS_TMP/inspect"
   showfile "Snapshot Layout: $(basename "$chosen")" "$IS_TMP/inspect"
 }
 
@@ -1110,6 +1150,17 @@ m_restore_interface(){
   [[ ${#archives[@]} -eq 0 ]] && { msg "Restore Pipeline" "No restorable snapshots populated."; return; }
   for a in "${archives[@]}"; do args+=("$a" "$(basename "$a")"); done
   chosen=$(menu "Restore Engine" "Select system baseline configuration target state:" "${args[@]}") || return
+  # Integrity-gate the restore: this extracts over /, so the wrong archive here
+  # damages the live system. Refuse on a checksum MISMATCH; warn (don't block) on
+  # a missing sidecar, which just means the archive predates v9.9.1.
+  verify_backup "$chosen"; local vrc=$?
+  case $vrc in
+    0) : ;;
+    1) msg "Snapshot Failed Verification" "REFUSING TO RESTORE.\n\n$(basename "$chosen")\n\nIts SHA-256 does not match the checksum recorded when it was created, so these are not the bytes IntelShield wrote — the archive has been replaced, edited, or damaged.\n\nExtracting it over / could break the running system. Pick another snapshot."
+       log_err "restore: sha256 MISMATCH on $chosen — refused"
+       return 1 ;;
+    2) yesno "Unverifiable Snapshot" "$(basename "$chosen") has no SHA-256 sidecar — it was created before v9.9.1, so it cannot be checked against the bytes written at creation.\n\nIt still lists cleanly, so it is not corrupt; it just cannot be proven to be the original archive.\n\nRestore it anyway?" || return ;;
+  esac
   yesno "Confirm System Rollback" "Are you sure you want to extract state archives over active configurations?\n\nAn automated pre-restore safety fallback snapshot will be run." || return
   infobox "Rollback Active" "Executing configuration extraction and target subsystem reloads..."
   do_backup >/dev/null 2>&1 || true
@@ -1645,10 +1696,10 @@ ark_config_set /etc/rkhunter.conf.local PORT_WHITELIST "\"TCP:${SSH_PORT:-22} TC
 ark_config_set /etc/rkhunter.conf UPDATE_MIRRORS 1; ark_config_set /etc/rkhunter.conf MIRRORS_MODE 0; ark_config_set /etc/rkhunter.conf WEB_CMD '""'; [[ -f /etc/default/rkhunter ]] && { ark_config_set /etc/default/rkhunter CRON_DAILY_RUN '"false"'; ark_config_set /etc/default/rkhunter CRON_DB_UPDATE '"false"'; ark_config_set /etc/default/rkhunter APT_AUTOGEN '"yes"'; }; fi; [[ "$quiet" == silent ]] || msg "Whitelist Safe Areas" "Safe-area whitelist applied."; }
 m_ark_install(){ ark_init; apt_do update; apt_do install -y rkhunter chkrootkit; ark_whitelist_safe_areas silent; rkhunter_present && { run rkhunter --update || true; run rkhunter --propupd || true; }; state_write; }
 ark_extract_paths(){ local logf="$1" outf="$2"; : >"$outf"; grep -Eo '(/[A-Za-z0-9._@%+=:,/ -]+)' "$logf" 2>/dev/null | sed 's/[[:space:]]*$//' | while read -r x; do [[ -e "$x" ]] && printf '%s\n' "$x"; done | sort -u >>"$outf" || true; }
-ark_scan_rkhunter(){ ark_init; rkhunter_present || return 1; local ts logf paths; ts=$(date +%Y%m%d_%H%M%S); logf="$ARK_LOG_DIR/rkhunter_${ts}.log"; paths="$ARK_DIR/rkhunter_${ts}.paths"; run rkhunter --update || true; rkhunter --check --sk --rwo --append-log --logfile "$logf" >>"$logf" 2>&1 || true; ark_extract_paths "$logf" "$paths"; ln -sfn "$logf" "$ARK_LOG_DIR/rkhunter_latest.log"; ln -sfn "$paths" "$ARK_DIR/rkhunter_latest.paths"; state_write; }
+ark_scan_rkhunter(){ ark_init; rkhunter_present || return 1; local ts logf paths; ts=$(date +%Y%m%d_%H%M%S); logf="$ARK_LOG_DIR/rkhunter_${ts}.log"; paths="$ARK_DIR/rkhunter_${ts}.paths"; run rkhunter --update || true; rkhunter --check --sk --rwo --append-log --logfile "$logf" >>"$LOG" 2>&1 || true; ark_extract_paths "$logf" "$paths"; ln -sfn "$logf" "$ARK_LOG_DIR/rkhunter_latest.log"; ln -sfn "$paths" "$ARK_DIR/rkhunter_latest.paths"; state_write; }
 ark_scan_chkrootkit(){ ark_init; chkrootkit_present || return 1; local ts logf paths opts=(); ts=$(date +%Y%m%d_%H%M%S); logf="$ARK_LOG_DIR/chkrootkit_${ts}.log"; paths="$ARK_DIR/chkrootkit_${ts}.paths"; source "$ARK_CONF" 2>/dev/null || true; [[ -n "${CHKROOTKIT_EXCLUDES:-}" ]] && opts=(-e "$CHKROOTKIT_EXCLUDES"); chkrootkit -q "${opts[@]}" >"$logf" 2>&1 || true; ark_extract_paths "$logf" "$paths"; ln -sfn "$logf" "$ARK_LOG_DIR/chkrootkit_latest.log"; ln -sfn "$paths" "$ARK_DIR/chkrootkit_latest.paths"; state_write; }
 ark_scan_all(){ rkhunter_present && ark_scan_rkhunter || true; chkrootkit_present && ark_scan_chkrootkit || true; msg "Anti Rootkit" "Scans complete. View Detection Monitor for results."; }
-ark_set_schedule(){ local tool="$1" time self; time=$(input "Schedule $tool" "Daily time HH:MM. Default midnight:" "00:00") || return 3; [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { msg Time "Invalid HH:MM"; return 1; }; self=$(install_self) || self="$0"; cat >/etc/systemd/system/intelshield-antirootkit-${tool}.service <<EOF
+ark_set_schedule(){ local tool="$1" time self; time=$(input "Schedule $tool" "Daily time HH:MM. Default midnight:" "00:00") || return 3; [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { msg Time "Invalid HH:MM"; return 1; }; self=$(install_self) || self="$0"; cat >"/etc/systemd/system/intelshield-antirootkit-${tool}.service" <<EOF
 [Unit]
 Description=IntelShield Anti Rootkit ${tool} scan
 Wants=network-online.target
@@ -1660,7 +1711,7 @@ IOSchedulingClass=idle
 RuntimeMaxSec=2h
 ExecStart=$self --antirootkit-scan $tool
 EOF
-cat >/etc/systemd/system/intelshield-antirootkit-${tool}.timer <<EOF
+cat >"/etc/systemd/system/intelshield-antirootkit-${tool}.timer" <<EOF
 [Unit]
 Description=Daily IntelShield Anti Rootkit ${tool} scan
 [Timer]
@@ -1669,8 +1720,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-run systemctl daemon-reload; run systemctl enable --now intelshield-antirootkit-${tool}.timer; state_write; }
-ark_disable_schedule(){ local tool="$1"; run systemctl disable --now intelshield-antirootkit-${tool}.timer || true; rm -f /etc/systemd/system/intelshield-antirootkit-${tool}.service /etc/systemd/system/intelshield-antirootkit-${tool}.timer; run systemctl daemon-reload; state_write; }
+run systemctl daemon-reload; run systemctl enable --now "intelshield-antirootkit-${tool}.timer"; state_write; }
+ark_disable_schedule(){ local tool="$1"; run systemctl disable --now "intelshield-antirootkit-${tool}.timer" || true; rm -f "/etc/systemd/system/intelshield-antirootkit-${tool}.service" /etc/systemd/system/"intelshield-antirootkit-${tool}.timer"; run systemctl daemon-reload; state_write; }
 ark_detections_view(){ local f="$IS_TMP/ark-detections" logf; { echo "IntelShield Anti Rootkit Detection Monitor - $(date -Is)"; echo; for logf in "$ARK_LOG_DIR"/*.log; do [[ -f "$logf" ]] || continue; echo "===== $(basename "$logf") ====="; grep -Ei 'warning|infected|suspicious|possible|rootkit|trojan|backdoor|found|vulnerable' "$logf" | tail -80 || echo "No high-signal findings."; echo; done; } >"$f"; showfile "Anti Rootkit Detection Monitor" "$f" 36 120; }
 ark_logs_menu(){ local files=() args=() f c; mapfile -t files < <(find "$ARK_LOG_DIR" -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null|sort -rn|cut -d' ' -f2-); [[ ${#files[@]} -gt 0 ]] || { msg Logs "No logs."; return 3; }; for f in "${files[@]}"; do args+=("$f" "$(basename "$f")"); done; c=$(menu Logs "Select log:" "${args[@]}") || return; showfile "$(basename "$c")" "$c" 36 120; }
 ark_safe_path(){ local x="${1:-}"; [[ -n "$x" && -e "$x" ]] || return 1; case "$x" in /proc/*|/sys/*|/dev/*|/run/*|/boot/*|/lib/*|/lib64/*|/bin/*|/sbin/*|/usr/*|/etc/*|/var/lib/*|/opt/3x-ui/*) return 2;; esac; return 0; }
@@ -2219,45 +2270,22 @@ suricata_intel_menu(){ local c m; while :; do m=$(suri_mode_get); c=$(menu "Suri
 
 
 #==============================================================================
-#  SURICATA 8 FIREWALL MODE  (v8.3 — deterministic packet pipeline, default-drop)
+#  SURICATA 8 FIREWALL MODE — REMOVED (legacy cleanup only)
 #==============================================================================
-# Suricata 8 introduces an experimental Firewall Mode that operates as a full
-# stateful firewall engine rather than a traditional IDS/IPS sensor. Key differences:
+# Suricata 8 shipped an experimental "firewall mode" (deterministic packet
+# pipeline, default-drop). IntelShield implemented it in v8.3, found it broken
+# on four independent counts (no accept rules, wrong config key, invalid entropy
+# syntax, wrong CLI flag — audit C-2), and disabled the entry point in v9.8.
+# v9.9.1 deletes the implementation: enable/disable/status/menu, the nft + unit
+# + rule writers, and the --suricata-fw flag are all gone. Use IPS mode
+# (--suricata-ips on) for inline blocking.
 #
-# PACKET PIPELINE:
-#   Traditional IDS:    af-packet capture → inspect → alert (passive copy)
-#   Traditional IPS:    NFQUEUE → inspect → alert/drop (inline, fail-open)
-#   Suricata 8 FW:      nfqueue → deterministic pipeline → default DROP
-#                        ↑ every packet that isn't explicitly accepted is dropped
-#
-# ACTION SCOPES (Suricata 8 explicit actions):
-#   accept:packet  — immediately accept this packet (no further inspection)
-#   accept:flow    — accept all future packets in this flow
-#   drop:packet    — immediately drop this packet
-#   drop:flow      — drop all future packets in this flow
-#   reject:packet  — drop + send ICMP unreachable / TCP RST
-#
-# RULE HOOKS:
-#   packet:filter  — runs on every packet before flow reassembly (fast path)
-#   app:filter     — runs after protocol detection (deep inspection path)
-#
-# DEFAULT POLICY: drop (if no rule accepts, the packet is dropped)
-# This is the opposite of traditional IPS where the default is pass.
+# What survives is ONLY what an upgraded host needs: a host that ran an older
+# IntelShield with firewall mode ON still has the nft table, the systemd unit,
+# and the drop-ins on disk, and its mode file still says "on". mode_get and
+# teardown exist to detect and remove that. Do not "simplify" them away.
 
-# Check if Suricata 8 firewall mode is available
-suricata_fw_check_version(){
-  local ver
-  ver="$(suricata -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
-  [[ -z "$ver" ]] && return 1
-  # Suricata 8.x+ required for firewall mode
-  local major minor
-  major="$(echo "$ver" | cut -d. -f1)"
-  minor="$(echo "$ver" | cut -d. -f2)"
-  (( major >= 8 )) && return 0
-  return 1
-}
-
-# Read the firewall mode state
+# Read the legacy firewall-mode state ("on" only on hosts upgraded from <=v9.8).
 suricata_fw_mode_get(){ cat "$SURICATA_FW_MODE_FILE" 2>/dev/null || echo off; }
 
 # Mutex management: only one of CrowdSec bouncer or Suricata FW mode can own
@@ -2270,193 +2298,8 @@ suricata_mutex_crowdsec_active(){
   have_cs && systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
 }
 
-# Write the Suricata 8 Firewall Mode nftables rules.
-# Priority mapping:
-#   priority 0  = CrowdSec bouncer (cheap IP-reputation drops at the edge)
-#   priority 10 = Suricata FW mode (deep inspection, deterministic pipeline)
-#
-# The FW mode chain uses a TWO-TIER approach:
-#   1. Explicit bypass rules (SSH, loopback, established) → accept
-#   2. Everything else → NFQUEUE (Suricata's deterministic pipeline)
-#   3. Suricata's internal default policy: DROP (no matching accept rule = drop)
-suricata_fw_write_nft(){
-  local nftbin; nftbin=$(command -v nft || echo /usr/sbin/nft)
-  local ncpu qmax i qargs="" qspec
-  ncpu=$(nproc 2>/dev/null || echo 1); qmax=$((ncpu-1)); (( qmax>3 )) && qmax=3; (( qmax<0 )) && qmax=0
-  for ((i=0;i<=qmax;i++)); do qargs+=" -q $i"; done
-  if (( qmax==0 )); then qspec="queue num 0 flags bypass"; else qspec="queue num 0-$qmax flags bypass,fanout"; fi
-
-  cat >"$SURICATA_FW_NFT" <<EOF
-#!/usr/sbin/nft -f
-# IntelShield · Suricata 8 Firewall Mode (deterministic packet pipeline)
-#
-# nftables priority orchestration:
-#   CrowdSec bouncer:  priority ${SURICATA_CROWDSEC_PRIORITY}  (edge — IP reputation)
-#   Suricata FW mode:  priority ${SURICATA_FW_PRIORITY}  (deep inspection, default-drop)
-#
-# 'flags bypass' = fail-open: if Suricata is not reading the queue (crashed,
-# restarting), the kernel ACCEPTS the packet — no outage or lockout.
-#
-# SSH is excluded from the queue to prevent lockout. Loopback is accepted.
-# Established TCP connections on SSH port bypass inspection.
-# The NFQUEUE verdict goes to Suricata's deterministic pipeline where the
-# default policy is DROP — only explicitly accepted packets survive.
-table inet ${SURICATA_FW_CHAIN} {
-    # Flow table for established connections (performance optimization)
-    set bypass_v4 {
-        type ipv4_addr
-        flags dynamic,timeout
-        timeout 30s
-    }
-    set bypass_v6 {
-        type ipv6_addr
-        flags dynamic,timeout
-        timeout 30s
-    }
-
-    chain input {
-        type filter hook input priority ${SURICATA_FW_PRIORITY}; policy drop;
-
-        # Loopback always accepted
-        iif "lo" accept
-
-        # SSH port excluded from queue (anti-lockout)
-        tcp dport $SSH_PORT accept
-
-        # ICMP for path MTU discovery and diagnostics (rate-limited)
-        ip protocol icmp limit rate 10/second accept
-        ip6 nexthdr icmpv6 limit rate 10/second accept
-
-        # All remaining traffic → Suricata NFQUEUE (deterministic pipeline)
-        meta l4proto { tcp, udp } $qspec
-    }
-
-    chain output {
-        type filter hook output priority ${SURICATA_FW_PRIORITY}; policy accept;
-
-        # Loopback always accepted
-        oif "lo" accept
-
-        # SSH source port excluded (return traffic for admin session)
-        tcp sport $SSH_PORT accept
-
-        # Outbound inspection (Suricata can inspect outbound for C2 detection)
-        meta l4proto { tcp, udp } $qspec
-    }
-}
-EOF
-}
-
-# Write the systemd drop-in for Suricata 8 Firewall Mode.
-# The key difference from IPS mode: Suricata runs with --firewall flag and
-# the NFQUEUE verdict uses deterministic pipeline (default-drop).
-suricata_fw_write_dropin(){
-  local suri_bin; suri_bin=$(command -v suricata || echo /usr/bin/suricata)
-  local ncpu qmax i qargs=""
-  ncpu=$(nproc 2>/dev/null || echo 1); qmax=$((ncpu-1)); (( qmax>3 )) && qmax=3; (( qmax<0 )) && qmax=0
-  for ((i=0;i<=qmax;i++)); do qargs+=" -q $i"; done
-
-  mkdir -p "$(dirname "$SURICATA_FW_DROPIN")"
-  cat >"$SURICATA_FW_DROPIN" <<EOF
-[Service]
-# Suricata 8 Firewall Mode: deterministic packet pipeline with default-drop.
-# --firewall enables the experimental firewall mode engine.
-# The pipeline processes packets through:
-#   1. packet:filter hooks (fast path, before flow reassembly)
-#   2. protocol detection
-#   3. app:filter hooks (deep inspection, after protocol detection)
-#   4. default policy: DROP (if no accept:packet or accept:flow matched)
-ExecStart=
-ExecStart=$suri_bin -c $SURICATA_YAML --pidfile /run/suricata.pid --firewall$qargs
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_IPC_LOCK CAP_SYS_RESOURCE
-Restart=on-failure
-RestartSec=3
-EOF
-}
-
-# Write the Suricata 8 Firewall Mode default-drop ruleset.
-# These rules use Suricata 8's explicit action scopes and rule hooks:
-#   - packet:filter rules run fast, before flow reassembly
-#   - app:filter rules run after protocol detection (deeper inspection)
-#   - accept:packet / accept:flow explicitly whitelist traffic
-#   - drop:flow blocks entire flows on first match
-suricata_fw_write_rules(){
-  local fw_rules="/etc/suricata/rules/intelshield-fw-defaults.rules"
-  mkdir -p "$(dirname "$fw_rules")"
-  cat >"$fw_rules" <<'EOF'
-# IntelShield Suricata 8 Firewall Mode — Default-Drop Pipeline Rules
-# These rules define the explicit accept/drop policy for the firewall mode.
-# Traffic NOT matching any accept rule is DROPPED by Suricata's default policy.
-#
-# Action scopes used:
-#   accept:packet  — accept this individual packet (fast path)
-#   accept:flow    — accept all future packets in this TCP/UDP flow
-#   drop:flow      — drop all future packets in this flow (persistent block)
-#   drop:packet    — drop this single packet (transient block)
-#
-# Rule hooks:
-#   packet:filter  — evaluated on every packet (pre-flow, fast path)
-#   app:filter     — evaluated after protocol detection (deep inspection)
-
-# --- packet:filter rules (fast path, pre-flow) ---
-
-# Accept DNS responses (essential for host resolution)
-alert dns any any -> any 53 (msg:"IntelShield FW: DNS response accepted"; \
-  flow:to_server,established; sid:9100001; rev:1; \
-  classtype:policy-violation;)
-
-# Accept ICMP/ICMPv6 (path MTU, diagnostics — rate-limited at nftables level)
-alert icmp any any -> any any (msg:"IntelShield FW: ICMP accepted"; \
-  sid:9100002; rev:1;)
-
-# --- app:filter rules (deep inspection, post-protocol-detection) ---
-
-# Block known exploit patterns with drop:flow (persistent block)
-drop http any any -> any any (msg:"IntelShield FW: SQL injection attempt"; \
-  flow:to_server,established; \
-  pcre:"/(union\s+select|insert\s+into|drop\s+table|update\s+.*set)/i"; \
-  sid:9100100; rev:1; classtype:web-application-attack;)
-
-drop http any any -> any any (msg:"IntelShield FW: Directory traversal"; \
-  flow:to_server,established; \
-  content:".."; http_uri; pcre:"/\.\.[\/\\\\]/"; \
-  sid:9100101; rev:1; classtype:web-application-attack;)
-
-# Block known malware C2 callbacks
-drop tcp any any -> any any (msg:"IntelShield FW: Suspicious outbound C2 pattern"; \
-  flow:to_server,established; \
-  dsize:<100; threshold:type limit, track by_src, count 3, seconds 60; \
-  sid:9100200; rev:1; classtype:trojan-activity;)
-
-# Entropy-based detection (Suricata 8 keyword): block high-entropy DNS
-# queries that may indicate DNS tunneling or DGA domains
-alert dns any any -> any 53 (msg:"IntelShield FW: High-entropy DNS (possible tunnel)"; \
-  flow:to_server,established; \
-  dns.query; entropy > 4.5; \
-  sid:9100300; rev:1; classtype:policy-violation;)
-
-# Lua transform rule (Suricata 8 luaxform): detect unusual User-Agent strings
-alert http any any -> any any (msg:"IntelShield FW: Anomalous User-Agent detected"; \
-  flow:to_server,established; \
-  http.user_agent; luaxform:normalize_ua; \
-  sid:9100301; rev:1; classtype:policy-violation;)
-EOF
-  echo "$fw_rules"
-}
-
-# Enable Suricata 8 Firewall Mode.
-# This replaces the traditional IDS/IPS mode with a deterministic packet pipeline.
-suricata_fw_enable(){
-  # v9.8: Firewall Mode disabled — 4 independent defects (see AUDIT-REPORT C-2)
-  # No accept rules, wrong config key, invalid entropy syntax, wrong CLI flag.
-  # Disabled pending a proper rewrite against Suricata 8 OISF documentation.
-  msg "Suricata 8 Firewall Mode" "Firewall Mode is DISABLED in v9.8.\n\nThis experimental feature has multiple defects that can cause total traffic loss.\nUse IPS mode (--suricata-ips on) for inline blocking instead."
-  return 1
-}
-
-# Teardown Suricata 8 Firewall Mode (quiet, no prompts — reused by profile
-# downgrades, component control, and uninstaller).
+# Tear down any legacy firewall-mode plumbing left by an older install (quiet,
+# no prompts — reused by profile downgrades, component control, and uninstall).
 suricata_fw_teardown(){
   local nftbin; nftbin=$(command -v nft || echo /usr/sbin/nft)
   rm -f "$SURICATA_FW_DROPIN"
@@ -2470,79 +2313,6 @@ suricata_fw_teardown(){
   echo off >"$SURICATA_FW_MODE_FILE" 2>/dev/null || true
   atomic_state_write "$SURICATA_MUTEX_FILE" "none" 2>/dev/null || true
 }
-
-# Disable Suricata 8 Firewall Mode and revert to IDS
-suricata_fw_disable(){
-  [[ "$(suricata_fw_mode_get)" == on ]] || { msg "Suricata 8 Firewall" "Firewall mode is not active."; return 3; }
-  suricata_fw_teardown
-  run systemctl restart suricata || true
-  state_write
-  # Offer to re-enable CrowdSec bouncer if it was stopped for the mutex
-  if have_cs && ! systemctl is-active --quiet crowdsec-firewall-bouncer; then
-    yesno "Re-enable CrowdSec Bouncer?" "Suricata Firewall mode is off. The CrowdSec firewall bouncer is currently stopped — re-enable it?" && run systemctl enable --now crowdsec-firewall-bouncer
-  fi
-  msg "Suricata 8 Firewall" "Reverted to IDS (passive) mode. Firewall mode plumbing removed."
-}
-
-# View Suricata 8 Firewall Mode status and exception policies
-suricata_fw_status(){
-  local f="$IS_TMP/suricata-fw-status"
-  {
-    echo "Suricata 8 Firewall Mode Status — $(date -Is)"
-    echo "================================================================"
-    echo "Firewall mode  : $(suricata_fw_mode_get)"
-    echo "Mutex owner    : $(suricata_mutex_get)"
-    echo "Engine version : $(suricata -V 2>/dev/null | tr -d '\n')"
-    echo "Mode file      : $(suri_mode_get)"
-    echo
-    echo "=== nftables rules ==="
-    nft list table inet "${SURICATA_FW_CHAIN}" 2>/dev/null || echo "(no firewall mode table)"
-    echo
-    echo "=== Exception policies (Suricata 8 granular stats) ==="
-    if [[ -f /var/log/suricata/stats.log ]]; then
-      grep -Ei 'exception|drop|reject|pass|tcp\.reassembly_gap|memcap|detect\.engine' \
-        /var/log/suricata/stats.log 2>/dev/null | tail -40 || echo "(no stats available)"
-    else
-      echo "(stats.log not found — Suricata may not have run yet)"
-    fi
-    echo
-    echo "=== CPU affinity ==="
-    # Suricata 8 auto-configures CPU affinity; show the result
-    grep -Ei 'thread|cpu|affinity|worker' "$SURICATA_YAML" 2>/dev/null | head -20 || echo "(check suricata.yaml for threading section)"
-    echo
-    echo "=== Dropped streams ==="
-    if [[ -f /var/log/suricata/stats.log ]]; then
-      grep -Ei 'flow\.tcp\.reassembly_gap|flow\.icmp\.frag|decoder\.ipv4\.trunc|decoder\.ipv6\.trunc' \
-        /var/log/suricata/stats.log 2>/dev/null | tail -10 || echo "(no drop counters)"
-    fi
-  } >"$f"
-  showfile "Suricata 8 Firewall Mode Status" "$f" 36 120
-}
-
-# Firewall Mode menu
-suricata_fw_menu(){
-  have suricata || { msg "Suricata 8 Firewall" "Install Suricata first."; return 1; }
-  local c m cs fw
-  while :; do
-    m=$(suri_mode_get); fw="$(suricata_fw_mode_get)"; cs=$(svc_state crowdsec-firewall-bouncer)
-    c=$(menu "Suricata 8 Firewall Mode" "Engine: ${m^^}   FW mode: ${fw}   CrowdSec: ${cs}   mutex: $(suricata_mutex_get)" \
-      W "What is Firewall Mode? (read this first)" \
-      E "Enable Firewall Mode (deterministic pipeline, default-drop)" \
-      D "Disable Firewall Mode — revert to passive IDS" \
-      S "View Firewall Mode status + exception policies" \
-      B "IPS blocking policy (which rules DROP)" \
-      b "Back") || return
-    case "$c" in
-      W) msg "Suricata 8 Firewall Mode" "EXPERIMENTAL — Suricata 8 Firewall Mode replaces traditional IDS/IPS with a DETERMINISTIC PACKET PIPELINE.\n\nHow it works:\n  1. nftables captures packets via NFQUEUE\n  2. Suricata processes them through a deterministic pipeline:\n     - packet:filter hooks (fast path, before flow reassembly)\n     - protocol detection\n     - app:filter hooks (deep inspection, after protocol detection)\n  3. Default policy: DROP (if no rule explicitly accepts)\n\nAction scopes (Suricata 8):\n  accept:packet  — accept this packet immediately\n  accept:flow    — accept all future packets in this flow\n  drop:packet    — drop this packet immediately\n  drop:flow      — drop all future packets in this flow\n  reject:packet  — drop + send ICMP unreachable / TCP RST\n\nnftables priority orchestration:\n  CrowdSec:  priority 0  (edge — cheap IP reputation drops)\n  Suricata:  priority 10 (deep inspection, deterministic pipeline)\n\nSafety rails:\n  • fail-open: if Suricata stops, kernel accepts traffic (no outage)\n  • SSH port excluded from queue (no lockout)\n  • Mutex prevents conflicts with CrowdSec bouncer\n\nStart with alert-only rules (default), then enable drops for high-confidence\ncategories once you've verified the pipeline works on your traffic mix." 24 96 ;;
-      E) suricata_fw_enable ;;
-      D) suricata_fw_disable ;;
-      S) suricata_fw_status ;;
-      B) suricata_drop_policy_menu ;;
-      b) return ;;
-    esac
-  done
-}
-
 #==============================================================================
 #  TRANSACTIONAL RULE MANAGEMENT  (v8.3 — bidirectional rules, new keywords)
 #==============================================================================
@@ -2749,7 +2519,7 @@ suricata_rule_state_toggle(){
 # Gate sequence: snapshot -> validate -> apply -> verify -> restart-or-rollback
 suricata_apply_transactional_rules(){
   local mode="${1:-validate}"  # validate | apply
-  local pre_snapshot post_snapshot
+  local pre_snapshot
   # Gate 1: Snapshot current state for rollback
   pre_snapshot="$IS_TMP/suricata-rules-pre-transactional"
   [[ -f /var/lib/suricata/rules/suricata.rules ]] && cp -a /var/lib/suricata/rules/suricata.rules "$pre_snapshot" 2>/dev/null
@@ -3843,6 +3613,15 @@ clam_core_scan(){
     infected=$((infected+1))
     path="$(sed 's/: [^:]* FOUND$//' <<<"$line")"
     sig="$(sed -E 's/.*: ([^:]*) FOUND$/\1/' <<<"$line")"
+    # Never mv a path we failed to parse. clamscan prints "<path>: <sig> FOUND",
+    # and the [^:] guard means <sig> cannot span a colon, so a path containing
+    # ": " still parses. A path containing a NEWLINE does not — it splits this
+    # read loop in two and yields a fragment that names no real file. Re-checking
+    # existence turns that into a logged skip instead of a bogus quarantine.
+    if [[ -z "$path" || ! -e "$path" ]]; then
+      clamlog "WARN: unparseable clamscan line, not quarantining: $line"
+      reported=$((reported+1)); continue
+    fi
     if [[ "$mode" == "quarantine" && ! "$path" =~ $CLAM_PROTECT ]]; then
       qf="${CLAM_QUAR}/$(date +%s)_$$_$(basename "$path")"
       fmeta="$(stat -c '%a:%u:%g' "$path" 2>/dev/null || echo '644:0:0')"   # remember mode/owner for a faithful restore
@@ -4596,7 +4375,7 @@ case "${1:-}" in
       *) echo "usage: $0 --suricata-ips on|off  (use with --non-interactive --yes for automation)" >&2; exit 2 ;;
     esac; exit $? ;;
   --suricata-fw)
-    echo "ERROR: Suricata 8 Firewall Mode is disabled in v9.8 — experimental feature removed pending rewrite." >&2
+    echo "ERROR: Suricata 8 Firewall Mode was removed in v9.9.1 (it never worked). Use --suricata-ips on." >&2
     exit 1 ;;
   --lock)
     preflight
